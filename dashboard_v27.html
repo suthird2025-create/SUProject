@@ -1,0 +1,2076 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Client Performance Dashboard</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+    <!-- Firebase Compat SDKs -->
+    <script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-app-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-auth-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-firestore-compat.js"></script>
+    <script>
+        const firebaseConfig = {
+            apiKey: "AIzaSyAD-Vdt7DaANNx2UF4R-AM5SJCkw_WEwUg",
+            authDomain: "client-performance-hub.firebaseapp.com",
+            projectId: "client-performance-hub",
+            storageBucket: "client-performance-hub.firebasestorage.app",
+            messagingSenderId: "763735614658",
+            appId: "1:763735614658:web:2076cbf440b529b9f7475b"
+        };
+
+        const app = firebase.initializeApp(firebaseConfig);
+        const auth = firebase.auth();
+        const db = firebase.firestore();
+
+        const ADMIN_EMAIL = "admin@clienthub.com";
+
+        let currentUser = null;
+        let currentUserRole = null;
+        let projects = [];
+        let monthlyData = [];
+        let campaignData = [];
+        let weeklyData = [];
+        let currentProjectId = null;
+        let currentCampaignProjectId = null;
+        let currentWeeklyProjectId = null;
+        let currentWeekEnding = null;
+        let pendingBusinessData = null;
+        let monthSelectorCallback = null;
+        let roasChartInst = null, spendSalesChartInst = null;
+
+        // ========== AUTH STATE ==========
+        auth.onAuthStateChanged(async (user) => {
+            if (user) {
+                currentUser = user;
+                const userDoc = await db.collection("users").doc(user.uid).get();
+                if (userDoc.exists) {
+                    currentUserRole = userDoc.data().role;
+                    const userName = userDoc.data().name || user.email;
+                    document.getElementById("currentUserName").textContent = `👤 ${userName} (${currentUserRole})`;
+                } else {
+                    currentUserRole = "member";
+                }
+                document.getElementById("loginPage").style.display = "none";
+                document.getElementById("dashboardApp").style.display = "block";
+                document.querySelectorAll(".admin-only").forEach(el => el.style.display = currentUserRole === "admin" ? "" : "none");
+                await loadAllData();
+                showSection('projects', null);
+            } else {
+                currentUser = null;
+                document.getElementById("loginPage").style.display = "block";
+                document.getElementById("dashboardApp").style.display = "none";
+            }
+        });
+
+        // ========== LOGIN ==========
+        window.handleLogin = async function() {
+            const email = document.getElementById("loginEmail").value.trim();
+            const password = document.getElementById("loginPassword").value;
+            const errEl = document.getElementById("loginError");
+            errEl.textContent = "";
+            if (!email || !password) { errEl.textContent = "Please enter both email and password!"; return; }
+            try {
+                document.getElementById("loginBtn").textContent = "⏳ Logging in...";
+                await auth.signInWithEmailAndPassword(email, password);
+            } catch(e) {
+                errEl.textContent = "❌ Incorrect email or password!";
+                document.getElementById("loginBtn").textContent = "🔐 Login";
+            }
+        };
+
+        window.logout = async function() {
+            await auth.signOut();
+        };
+
+        // ========== ADMIN: CREATE USER ==========
+        window.createUser = async function() {
+            const name = document.getElementById("newUserName").value.trim();
+            const email = document.getElementById("newUserEmail").value.trim();
+            const password = document.getElementById("newUserPassword").value;
+            const role = document.getElementById("newUserRole").value;
+            const errEl = document.getElementById("createUserError");
+            errEl.textContent = "";
+            if (!name || !email || !password) { errEl.textContent = "Please fill in all fields!"; return; }
+            try {
+                const secondaryApp = firebase.initializeApp(firebaseConfig, "secondary-" + Date.now());
+                const secondaryAuth = secondaryApp.auth();
+                const cred = await secondaryAuth.createUserWithEmailAndPassword(email, password);
+                await secondaryAuth.signOut();
+                await db.collection("users").doc(cred.user.uid).set({
+                    name, email, role,
+                    createdAt: new Date().toISOString(),
+                    createdBy: currentUser.uid
+                });
+                alert(`✅ User "${name}" (${role}) created!`);
+                document.getElementById("newUserName").value = "";
+                document.getElementById("newUserEmail").value = "";
+                document.getElementById("newUserPassword").value = "";
+                loadUsersList();
+                closeUserModal();
+            } catch (e) {
+                errEl.textContent = "❌ Error: " + (e.message.includes("email-already") ? "This email is already in use!" : e.message);
+            }
+        };
+
+        window.loadUsersList = async function() {
+            const usersDiv = document.getElementById("usersList");
+            if (!usersDiv) return;
+            usersDiv.innerHTML = "<p style='color:#888'>Loading...</p>";
+            const snap = await db.collection("users").get();
+            if (snap.empty) { usersDiv.innerHTML = "<p>No users found.</p>"; return; }
+            let html = `<table style="width:100%;border-collapse:collapse;font-size:13px;">
+                <thead><tr style="background:#f8fafc;"><th style="padding:8px;text-align:left;">Name</th><th>Email</th><th>Role</th><th>Action</th></tr></thead><tbody>`;
+            snap.forEach(d => {
+                const u = d.data();
+                html += `<tr style="border-bottom:1px solid #e2e8f0;">
+                    <td style="padding:8px;">${u.name}</td>
+                    <td>${u.email}</td>
+                    <td><span style="background:${u.role==='admin'?'#dbeafe':'#d1fae5'};padding:2px 8px;border-radius:10px;">${u.role}</span></td>
+                    <td><button class="btn btn-outline" style="background:#fee2e2;font-size:11px;padding:3px 8px;" onclick="deleteUser('${d.id}','${u.email}')">🗑️</button></td>
+                </tr>`;
+            });
+            html += "</tbody></table>";
+            usersDiv.innerHTML = html;
+        };
+
+        window.deleteUser = async function(uid, email) {
+            if (!confirm(`Delete user ${email}?`)) return;
+            await db.collection("users").doc(uid).delete();
+            loadUsersList();
+        };
+
+        // ========== FIRESTORE: REALTIME LISTENERS ==========
+        let _unsubProjects = null, _unsubMonthly = null, _unsubCampaign = null, _unsubWeekly = null;
+
+        function loadAllData() {
+            showSync("⏳ Loading...", "#f59e0b");
+
+            if (_unsubProjects) _unsubProjects();
+            if (_unsubMonthly)  _unsubMonthly();
+            if (_unsubCampaign) _unsubCampaign();
+            if (_unsubWeekly)   _unsubWeekly();
+
+            _unsubProjects = db.collection("projects").onSnapshot(snap => {
+                projects = [];
+                snap.forEach(d => projects.push({ ...d.data(), firestoreId: d.id }));
+                renderProjects();
+                updateProjectSelects();
+                showSync("🔄 Projects updated!", "#10b981");
+            }, e => showSync("❌ " + e.message, "#ef4444"));
+
+            _unsubMonthly = db.collection("monthlyData").onSnapshot(snap => {
+                monthlyData = [];
+                snap.forEach(d => monthlyData.push({ ...d.data(), firestoreId: d.id }));
+                renderProjects();
+                if (currentProjectId) refreshMonthlyData();
+                showSync("🔄 Monthly data updated!", "#10b981");
+            }, e => showSync("❌ " + e.message, "#ef4444"));
+
+            _unsubCampaign = db.collection("campaignData").onSnapshot(snap => {
+                campaignData = [];
+                snap.forEach(d => campaignData.push({ ...d.data(), firestoreId: d.id }));
+                if (currentCampaignProjectId) filterCampaignData();
+            }, e => showSync("❌ " + e.message, "#ef4444"));
+
+            _unsubWeekly = db.collection("weeklyData").onSnapshot(snap => {
+                weeklyData = [];
+                snap.forEach(d => weeklyData.push({ ...d.data(), firestoreId: d.id }));
+                if (currentWeeklyProjectId) onWeeklyProjectChange();
+            }, e => showSync("❌ " + e.message, "#ef4444"));
+
+            populateYearFilter();
+            loadMarketplaces();
+        }
+
+        async function saveProject(proj) {
+            await db.collection("projects").doc(String(proj.id)).set(proj);
+            showSync("☁️ Saved!");
+        }
+        async function saveMonthlyRecord(record) {
+            await db.collection("monthlyData").doc(String(record.id)).set(record);
+            showSync("☁️ Saved!");
+            await autoUpdatePerformanceStatus(record.projectId);
+        }
+
+        async function autoUpdatePerformanceStatus(projectId) {
+            const monthOrder = ["January","February","March","April","May","June","July","August","September","October","November","December"];
+            const pData = monthlyData.filter(d => d.projectId === projectId);
+            const sorted = [...pData].sort((a,b) => {
+                if (a.year !== b.year) return parseInt(a.year) - parseInt(b.year);
+                return monthOrder.indexOf(a.month) - monthOrder.indexOf(b.month);
+            });
+            const latest = sorted.length > 0 ? sorted[sorted.length - 1] : null;
+            let newStatus;
+            if (!latest || latest.roas === 0) {
+                newStatus = "Good";      // 🔵 New Client — no data
+            } else if (latest.roas < 2) {
+                newStatus = "Critical";  // 🔴 ROAS < 2
+            } else if (latest.roas <= 3) {
+                newStatus = "Average";   // 🟡 ROAS 2–3
+            } else {
+                newStatus = "Excellent"; // 🟢 ROAS > 3
+            }
+            const projIdx = projects.findIndex(p => p.id === projectId);
+            if (projIdx !== -1 && projects[projIdx].performanceStatus !== newStatus) {
+                projects[projIdx].performanceStatus = newStatus;
+                await db.collection("projects").doc(String(projectId)).update({ performanceStatus: newStatus });
+                showSync("🔄 Status auto-updated → " + newStatus, "#2a5298");
+            }
+        }
+        async function saveCampaignRecord(records) {
+            for (const r of records) await db.collection("campaignData").doc(r.campaignId).set(r);
+            showSync("☁️ Saved!");
+        }
+        async function saveWeeklyRecord(record) {
+            const key = `${record.projectId}_${record.weekEnding}`;
+            await db.collection("weeklyData").doc(key).set(record);
+            showSync("☁️ Saved!");
+        }
+        async function deleteMonthlyFromDB(id) {
+            await db.collection("monthlyData").doc(String(id)).delete();
+        }
+        async function deleteWeeklyFromDB(projectId, weekEnding) {
+            const key = `${projectId}_${weekEnding}`;
+            await db.collection("weeklyData").doc(key).delete();
+        }
+
+        function showSync(msg, color="#10b981") {
+            const el = document.getElementById("syncStatus");
+            if (el) { el.textContent = msg; el.style.color = color; setTimeout(()=>{ el.textContent=""; }, 3000); }
+        }
+
+        // ========== PROJECTS ==========
+        // Strategy color map — bg/color = badge, hbg/hcolor = card header
+        const strategyBadgeColors = {
+            'Setup':         { bg:'#f3f4f6', color:'#374151', hbg:'#e5e7eb',         hcolor:'#1f2937', cbg:'rgba(0,0,0,0.10)' },
+            'Launch':        { bg:'#d1fae5', color:'#065f46', hbg:'#059669',         hcolor:'#ffffff', cbg:'rgba(255,255,255,0.20)' },
+            'Optimizations': { bg:'#dbeafe', color:'#1e40af', hbg:'#3b82f6',         hcolor:'#ffffff', cbg:'rgba(255,255,255,0.20)' },
+            'Scale':         { bg:'#1e3a8a', color:'#ffffff', hbg:'#1e3a8a',         hcolor:'#ffffff', cbg:'rgba(255,255,255,0.18)' },
+            'Maintain':      { bg:'#16a34a', color:'#ffffff', hbg:'#16a34a',         hcolor:'#ffffff', cbg:'rgba(255,255,255,0.20)' },
+            'Paused':        { bg:'#fee2e2', color:'#991b1b', hbg:'#fca5a5',         hcolor:'#7f1d1d', cbg:'rgba(127,29,29,0.12)' }
+        };
+        const defaultHeader = { hbg:'linear-gradient(135deg,#1e3c72,#2a5298)', hcolor:'#ffffff', cbg:'rgba(255,255,255,0.18)' };
+
+        function renderProjects() {
+            const container = document.getElementById("projectsList");
+            if (projects.length === 0) { container.innerHTML = '<p style="color:#94a3b8;padding:20px;">No projects found. Click "Add New Project" to get started.</p>'; renderAlertsPanel(); return; }
+            const statusColors = { Excellent:'#d1fae5', Good:'#dbeafe', Average:'#fef3c7', Critical:'#fee2e2' };
+            const statusTextColors = { Excellent:'#065f46', Good:'#1e40af', Average:'#92400e', Critical:'#991b1b' };
+            const monthOrder = ["January","February","March","April","May","June","July","August","September","October","November","December"];
+            container.innerHTML = projects.map(p => {
+                const pData = monthlyData.filter(d => d.projectId === p.id);
+                // Sort by year then month to get truly latest record
+                const sorted = [...pData].sort((a,b) => {
+                    if (a.year !== b.year) return parseInt(a.year) - parseInt(b.year);
+                    return monthOrder.indexOf(a.month) - monthOrder.indexOf(b.month);
+                });
+                const latest = sorted.length > 0 ? sorted[sorted.length-1] : null;
+                const hasAlert = pData.some(d => (d.acos > 40 || d.roas < 2) && d.roas > 0);
+                const sc = strategyBadgeColors[p.projectStrategy] || { bg:'#f1f5f9', color:'#64748b' };
+                const hdr = p.projectStrategy ? sc : defaultHeader;
+                const headerBg = hdr.hbg || 'linear-gradient(135deg,#1e3c72,#2a5298)';
+                const headerColor = hdr.hcolor || '#ffffff';
+                const codeBadgeBg = hdr.cbg || 'rgba(255,255,255,0.18)';
+                // For light headers (Setup/Paused) adjust sub-text opacity
+                const isLight = ['Setup','Paused'].includes(p.projectStrategy);
+                const subColor = isLight ? 'rgba(0,0,0,0.5)' : 'rgba(255,255,255,0.75)';
+                const stratLabel = p.projectStrategy || '';
+                const statusBg = statusColors[p.performanceStatus] || '#f1f5f9';
+                const statusTc = statusTextColors[p.performanceStatus] || '#475569';
+                // Mini stats from latest monthly record
+                const latestSales  = latest ? '$'+(latest.totalSales||0).toLocaleString(undefined,{maximumFractionDigits:0}) : '-';
+                const latestSpend  = latest ? '$'+(latest.ppcSpend||0).toLocaleString(undefined,{maximumFractionDigits:0}) : '-';
+                const latestRoas   = latest && latest.roas > 0 ? latest.roas.toFixed(1)+'x' : '-';
+                const latestAcos   = latest && latest.acos > 0 ? latest.acos.toFixed(1)+'%' : '-';
+                const latestMonth  = latest ? latest.month.slice(0,3)+' '+latest.year : null;
+                return `
+                <div class="project-bar-card">
+                    <div class="pbar-header" style="background:${headerBg};">
+                        <div class="pbar-code" style="background:${codeBadgeBg};color:${headerColor};">${p.clientCode}</div>
+                        <div class="pbar-header-info">
+                            <div class="pbar-name" style="color:${headerColor};">${p.clientName}${hasAlert ? '<span class="alert-dot" style="background:#fbbf24;box-shadow:0 0 0 2px rgba(255,255,255,0.4);"></span>' : ''}</div>
+                            <div class="pbar-header-sub" style="color:${isLight ? 'rgba(0,0,0,0.65)' : 'rgba(255,255,255,0.95)'};font-size:13px;font-weight:700;letter-spacing:0.3px;margin-top:2px;">🌍 ${p.primaryMarketplace||'-'}</div>
+                        </div>
+                        ${stratLabel ? `<span style="background:${codeBadgeBg};color:${headerColor};padding:2px 10px;border-radius:20px;font-size:10px;font-weight:800;letter-spacing:0.5px;white-space:nowrap;">${stratLabel}</span>` : ''}
+                    </div>
+                    <div class="pbar-body">
+                        <div class="pbar-meta">
+                            <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:6px;width:100%;margin-bottom:4px;">
+                                <div style="display:flex;align-items:center;gap:6px;">
+                                    <span style="font-size:11px;font-weight:700;color:#94a3b8;text-transform:uppercase;letter-spacing:0.4px;">👤 Assisted</span>
+                                    <span style="font-size:13px;font-weight:800;color:#2a5298;">${p.assignedTo||'—'}</span>
+                                </div>
+                                ${p.performanceStatus ? `<span style="background:${statusBg};color:${statusTc};padding:3px 12px;border-radius:20px;font-size:11px;font-weight:700;border:1.5px solid ${statusTc};letter-spacing:0.3px;">${p.performanceStatus}</span>` : ''}
+                            </div>
+                        </div>
+                        <div class="pbar-stats">
+                            <div class="pbar-stat"><div class="pbar-stat-val">${latestSales}</div><div class="pbar-stat-lbl">Total Sales</div></div>
+                            <div class="pbar-stat"><div class="pbar-stat-val">${latestSpend}</div><div class="pbar-stat-lbl">Ad Spend</div></div>
+                            <div class="pbar-stat"><div class="pbar-stat-val" style="color:#2a5298;">${latestRoas}</div><div class="pbar-stat-lbl">ROAS</div></div>
+                            <div class="pbar-stat"><div class="pbar-stat-val" style="color:${latest&&latest.acos>40?'#ef4444':'#10b981'};">${latestAcos}</div><div class="pbar-stat-lbl">ACOS</div></div>
+                        </div>
+                    </div>
+                    <div class="pbar-footer">
+                        <span class="pbar-last-data">${latestMonth ? '📅 '+latestMonth : 'No data yet'}</span>
+                        <button class="btn-view-details" onclick="openProjectDetails(${p.id})">🔍 View Details</button>
+                    </div>
+                </div>`;
+            }).join('');
+            renderAlertsPanel();
+        }
+
+        window.openProjectDetails = function(id) {
+            const p = projects.find(p => p.id === id);
+            if (!p) return;
+            const pData = monthlyData.filter(d => d.projectId === p.id);
+            const monthOrder = ["January","February","March","April","May","June","July","August","September","October","November","December"];
+            const sorted = [...pData].sort((a,b) => {
+                if (a.year !== b.year) return parseInt(a.year) - parseInt(b.year);
+                return monthOrder.indexOf(a.month) - monthOrder.indexOf(b.month);
+            });
+            const latest = sorted.length > 0 ? sorted[sorted.length-1] : null;
+            // Pull real values from latest monthly report record
+            const latestTotalSales = latest ? latest.totalSales : null;
+            const latestRoas   = latest && latest.roas > 0 ? latest.roas.toFixed(2) : null;
+            const latestAcos   = latest && latest.acos > 0 ? latest.acos.toFixed(1) : null;
+            const latestSpend  = latest ? latest.ppcSpend : null;
+            const latestPpcSales = latest ? latest.ppcSales : null;
+            const latestMonth  = latest ? latest.month + ' ' + latest.year : null;
+            const sc = strategyBadgeColors[p.projectStrategy] || { bg:'#f1f5f9', color:'#64748b' };
+            const statusColors = { Excellent:'#d1fae5', Good:'#dbeafe', Average:'#fef3c7', Critical:'#fee2e2' };
+            const statusTextColors = { Excellent:'#065f46', Good:'#1e40af', Average:'#92400e', Critical:'#991b1b' };
+
+            document.getElementById("projDetailBody").innerHTML = `
+                <div style="display:flex;align-items:center;gap:14px;margin-bottom:20px;padding-bottom:16px;border-bottom:1px solid #e2e8f0;">
+                    <div style="background:linear-gradient(135deg,#1e3c72,#2a5298);color:white;border-radius:12px;padding:12px 18px;font-size:22px;font-weight:900;letter-spacing:1px;">${p.clientCode}</div>
+                    <div>
+                        <div style="font-size:20px;font-weight:800;color:#1e293b;">${p.clientName}</div>
+                        <div style="display:flex;gap:8px;margin-top:6px;flex-wrap:wrap;">
+                            ${p.projectStrategy ? `<span style="background:${sc.bg};color:${sc.color};padding:3px 12px;border-radius:20px;font-size:12px;font-weight:700;">${p.projectStrategy}</span>` : ''}
+                            ${p.performanceStatus ? `<span style="background:${statusColors[p.performanceStatus]||'#f1f5f9'};color:${statusTextColors[p.performanceStatus]||'#475569'};padding:3px 12px;border-radius:20px;font-size:12px;font-weight:600;">${p.performanceStatus}</span>` : ''}
+                            ${latestMonth ? `<span style="background:#f1f5f9;color:#64748b;padding:3px 12px;border-radius:20px;font-size:11px;">📅 Latest: ${latestMonth}</span>` : ''}
+                        </div>
+                    </div>
+                </div>
+                <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:20px;">
+                    <div class="detail-info-box"><div class="detail-label">🌍 Marketplace</div><div class="detail-value">${p.primaryMarketplace||'-'}</div></div>
+                    <div class="detail-info-box"><div class="detail-label" id="projDetailAssignedLabel">👤 Assigned To</div><div class="detail-value" id="projDetailAssignedVal">${p.assignedTo||'Loading...'}</div></div>
+                    <div class="detail-info-box"><div class="detail-label">💰 Monthly Budget</div><div class="detail-value">$${(p.monthlyBudget||0).toLocaleString()}</div></div>
+                    <div class="detail-info-box" style="border-left:3px solid #10b981;"><div class="detail-label">📈 Total Sales <span style="font-size:9px;color:#10b981;">(from Monthly Report)</span></div><div class="detail-value" style="color:#10b981;">${latestTotalSales != null ? '$'+(latestTotalSales).toLocaleString(undefined,{maximumFractionDigits:2}) : '-'}</div></div>
+                    <div class="detail-info-box"><div class="detail-label">🛒 PPC Sales</div><div class="detail-value">${latestPpcSales != null ? '$'+(latestPpcSales).toLocaleString(undefined,{maximumFractionDigits:2}) : '-'}</div></div>
+                    <div class="detail-info-box"><div class="detail-label">💸 Ad Spend</div><div class="detail-value">${latestSpend != null ? '$'+(latestSpend).toLocaleString(undefined,{maximumFractionDigits:2}) : '-'}</div></div>
+                    <div class="detail-info-box" style="border-left:3px solid #2a5298;"><div class="detail-label">📊 ROAS</div><div class="detail-value" style="color:#2a5298;">${latestRoas ? latestRoas+'x' : '-'}</div></div>
+                    <div class="detail-info-box" style="border-left:3px solid ${latest&&latest.acos>40?'#ef4444':'#10b981'};"><div class="detail-label">🎯 ACOS</div><div class="detail-value" style="color:${latest&&latest.acos>40?'#ef4444':'#10b981'};">${latestAcos ? latestAcos+'%' : '-'}</div></div>
+                </div>
+                ${p.notes ? `<div style="background:#f8fafc;border-radius:10px;padding:12px 16px;margin-bottom:20px;"><div style="font-size:11px;font-weight:700;color:#94a3b8;margin-bottom:4px;">📝 NOTES</div><div style="font-size:13px;color:#475569;">${p.notes}</div></div>` : ''}
+                <div style="border-top:1px solid #e2e8f0;padding-top:16px;">
+                    <div style="font-size:11px;font-weight:700;color:#94a3b8;margin-bottom:10px;">📂 REPORTS</div>
+                    <div style="display:flex;gap:10px;flex-wrap:wrap;">
+                        <button class="btn btn-primary" onclick="closeProjectDetails();currentProjectId=${p.id};showSection('monthly');setTimeout(()=>{document.getElementById('projectSelectMonthly').value=${p.id};onMonthlyProjectChange();},100);">📅 Monthly Report</button>
+                        <button class="btn btn-primary" onclick="closeProjectDetails();currentCampaignProjectId=${p.id};showSection('campaign');setTimeout(()=>{document.getElementById('projectSelectCampaign').value=${p.id};onCampaignProjectChange();},100);">🎯 Campaign Tracker</button>
+                        <button class="btn btn-primary" onclick="closeProjectDetails();currentWeeklyProjectId=${p.id};showSection('weekly');setTimeout(()=>{document.getElementById('projectSelectWeekly').value=${p.id};onWeeklyProjectChange();},100);">📈 Weekly Tracking</button>
+                    </div>
+                </div>`;
+            document.getElementById("projDetailProjectId").value = id;
+            document.getElementById("projectDetailsModal").style.display = "flex";
+            // Fetch assigned member name from Firestore by assignedUid if assignedTo is empty
+            if (!p.assignedTo && p.assignedUid) {
+                db.collection("users").doc(p.assignedUid).get().then(userDoc => {
+                    const nameEl = document.getElementById("projDetailAssignedVal");
+                    if (nameEl) nameEl.textContent = userDoc.exists ? (userDoc.data().name || '-') : '-';
+                }).catch(() => {
+                    const nameEl = document.getElementById("projDetailAssignedVal");
+                    if (nameEl) nameEl.textContent = '-';
+                });
+            } else if (!p.assignedTo) {
+                const nameEl = document.getElementById("projDetailAssignedVal");
+                if (nameEl) nameEl.textContent = '-';
+            }
+        };
+
+        window.closeProjectDetails = function() {
+            document.getElementById("projectDetailsModal").style.display = "none";
+        };
+
+        window.selectProject = function(id) { currentProjectId = id; showSection('monthly'); setTimeout(()=>onMonthlyProjectChange(),100); };
+
+        window.deleteProject = async function(id) {
+            if (!confirm("Delete project?")) return;
+            projects = projects.filter(p => p.id !== id);
+            await db.collection("projects").doc(String(id)).delete();
+            monthlyData = monthlyData.filter(d => d.projectId !== id);
+            campaignData = campaignData.filter(c => c.projectId !== id);
+            weeklyData = weeklyData.filter(w => w.projectId !== id);
+            renderProjects(); updateProjectSelects();
+        };
+
+        function updateProjectSelects() {
+            const opts = '<option value="">-- Select Project --</option>' + projects.map(p=>`<option value="${p.id}">${p.clientCode} - ${p.clientName}</option>`).join('');
+            ["projectSelectMonthly","projectSelectCampaign","projectSelectWeekly"].forEach(id => {
+                const el = document.getElementById(id);
+                if (el) el.innerHTML = opts;
+            });
+            const assignEl = document.getElementById("assignedToUid");
+            if (assignEl) loadUsersForAssign();
+        }
+
+        async function loadUsersForAssign(preSelectUid="") {
+            const snap = await db.collection("users").get();
+            const sel = document.getElementById("assignedToUid");
+            if (!sel) return;
+            sel.innerHTML = '<option value="">-- Select Member --</option>';
+            snap.forEach(d => { sel.innerHTML += `<option value="${d.id}">${d.data().name} (${d.data().role})</option>`; });
+            if (preSelectUid) sel.value = preSelectUid;
+        }
+
+        window.openProjectModal = function(id=null) {
+            document.getElementById("projectForm").reset();
+            document.getElementById("editProjectId").value = "";
+            document.getElementById("projectModalTitle").textContent = id ? "Edit Project" : "Add New Project";
+            populateMarketplaceDropdowns();
+            if (id) {
+                const p = projects.find(p => p.id === id);
+                if (p) {
+                    document.getElementById("editProjectId").value = p.id;
+                    document.getElementById("clientCode").value = p.clientCode;
+                    document.getElementById("clientName").value = p.clientName;
+                    const strEl = document.getElementById("projectStrategy");
+                    strEl.value = p.projectStrategy||"";
+                    updateStrategyColor(strEl);
+                    document.getElementById("performanceStatus").value = p.performanceStatus;
+                    document.getElementById("marketplaceProj").value = p.primaryMarketplace||"";
+                    document.getElementById("monthlyBudget").value = p.monthlyBudget;
+                    document.getElementById("currentRoas").value = p.currentRoas;
+                    document.getElementById("monthlyRevenue").value = p.monthlyRevenue;
+                    document.getElementById("lastUpdated").value = p.lastUpdated||"";
+                    document.getElementById("notes").value = p.notes||"";
+                }
+            }
+            document.getElementById("projectModal").style.display = "flex";
+            const preUid = id ? (projects.find(p=>p.id===id)?.assignedUid||"") : "";
+            loadUsersForAssign(preUid);
+        };
+        window.closeProjectModal = function() { document.getElementById("projectModal").style.display = "none"; };
+
+        window.saveProjectForm = async function(e) {
+            e.preventDefault();
+            const id = document.getElementById("editProjectId").value;
+            const newProj = {
+                id: id ? parseInt(id) : Date.now(),
+                clientCode: document.getElementById("clientCode").value,
+                clientName: document.getElementById("clientName").value,
+                projectStrategy: document.getElementById("projectStrategy").value,
+                performanceStatus: document.getElementById("performanceStatus").value || "Good",
+                primaryMarketplace: document.getElementById("marketplaceProj").value,
+                monthlyBudget: parseFloat(document.getElementById("monthlyBudget").value)||0,
+                currentRoas: parseFloat(document.getElementById("currentRoas").value)||0,
+                monthlyRevenue: parseFloat(document.getElementById("monthlyRevenue").value)||0,
+                assignedTo: (()=>{ const sel=document.getElementById("assignedToUid"); const opt=sel.options[sel.selectedIndex]; return (opt&&opt.value) ? opt.text.replace(/\s*\(.*\)$/,'').trim() : ""; })(),
+                assignedUid: document.getElementById("assignedToUid")?.value || "",
+                lastUpdated: document.getElementById("lastUpdated").value || new Date().toISOString().slice(0,10),
+                notes: document.getElementById("notes").value,
+                createdBy: currentUser.uid
+            };
+            if (id) { const idx = projects.findIndex(p => p.id == id); if(idx!==-1) projects[idx]=newProj; }
+            else projects.push(newProj);
+            await saveProject(newProj);
+            closeProjectModal();
+            renderProjects();
+            updateProjectSelects();
+        };
+
+        // ========== MONTHLY REPORT ==========
+        window.onMonthlyProjectChange = function() {
+            const sel = document.getElementById("projectSelectMonthly");
+            currentProjectId = sel.value ? parseInt(sel.value) : null;
+            const uploadArea = document.getElementById("monthlyUploadArea");
+            const info = document.getElementById("monthlyProjectInfo");
+            pendingBusinessData = null;
+            document.getElementById("businessStatus").innerHTML = "";
+            document.getElementById("campaignStatus").innerHTML = "";
+            if (currentProjectId) {
+                const p = projects.find(p => p.id === currentProjectId);
+                info.innerHTML = `✅ ${p.clientCode} - ${p.clientName} (${p.primaryMarketplace||'USA'})`;
+                uploadArea.style.display = "block";
+                refreshMonthlyData();
+            } else { info.innerHTML = ""; uploadArea.style.display = "none"; }
+        };
+
+        window.uploadBusinessCSV = function(input) {
+            if (!currentProjectId) { alert("Please select a project first!"); input.value=""; return; }
+            const file = input.files[0]; if (!file) return; input.value="";
+            openMonthSelector(function(selectedMonth, selectedYear) {
+                const reader = new FileReader();
+                reader.onload = function(e) {
+                    const lines = e.target.result.split(/\r?\n/);
+                    let totalSales=0, totalUnits=0, totalOrders=0;
+                    let foundSummary = false;
+
+                    // Strategy 1: Try to find "Sales Snapshot" summary row (Amazon Sales Dashboard format)
+                    // Format: Total Order Items, Units Ordered, Ordered Product Sales, ...
+                    // The data row comes right after the header "Total Order Items,Units Ordered,Ordered Product Sales,..."
+                    for (let i = 0; i < lines.length; i++) {
+                        const line = lines[i];
+                        if (line.includes('Total Order Items') && line.includes('Units Ordered') && line.includes('Ordered Product Sales')) {
+                            // Next line is the summary data
+                            const nextLine = lines[i+1];
+                            if (nextLine) {
+                                const parts = parseCSVLine(nextLine);
+                                if (parts.length >= 3) {
+                                    totalOrders = parseInt(parts[0]?.replace(/[^0-9]/g,'')||0);
+                                    totalUnits  = parseInt(parts[1]?.replace(/[^0-9]/g,'')||0);
+                                    totalSales  = parseFloat(parts[2]?.replace(/[^0-9.-]/g,'')||0);
+                                    foundSummary = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+
+                    // Strategy 2: Fallback — parse daily date rows (simple 3-col CSV)
+                    if (!foundSummary || totalSales === 0) {
+                        totalSales = 0; totalUnits = 0; totalOrders = 0;
+                        for (const line of lines) {
+                            const parts = parseCSVLine(line);
+                            if (parts.length < 2) continue;
+                            const dateStr = parts[0].replace(/["']/g,'').trim();
+                            const sales = parseFloat(parts[1]?.replace(/[^0-9.-]/g,'')||0);
+                            const units = parseInt(parts[2]?.replace(/[^0-9]/g,'')||0);
+                            if (dateStr && !isNaN(sales)) {
+                                const d = new Date(dateStr);
+                                if (!isNaN(d.getTime())) { totalSales += sales; totalUnits += units; totalOrders += 1; }
+                            }
+                        }
+                    }
+
+                    pendingBusinessData = {};
+                    pendingBusinessData[`${selectedYear}-${selectedMonth}`] = { year:selectedYear, month:selectedMonth, totalSales, unitsOrders:totalUnits, totalOrders };
+                    document.getElementById("businessStatus").innerHTML = `✅ Loaded: ${selectedMonth} ${selectedYear} — Sales: $${totalSales.toFixed(2)} | Units: ${totalUnits} | Orders: ${totalOrders}`;
+                    document.getElementById("campaignStatus").innerHTML = `⏳ Now upload the Campaign CSV`;
+                };
+                reader.readAsText(file);
+            });
+        };
+
+        window.uploadCampaignReportCSV = async function(input) {
+            if (!currentProjectId) { alert("Please select a project first!"); input.value=""; return; }
+            if (!pendingBusinessData || Object.keys(pendingBusinessData).length===0) { alert("Please upload the Business Report first!"); input.value=""; return; }
+            const file = input.files[0]; if (!file) return;
+            const reader = new FileReader();
+            reader.onload = async function(e) {
+                const lines = e.target.result.split(/\r?\n/);
+                let totalSpend=0,totalSales=0,totalClicks=0,totalImpressions=0,totalOrders=0,totalCtrSum=0,ctrRowCount=0;
+                // Auto-detect ALL columns from header row
+                let spendColIdx=-1, salesColIdx=-1, clicksColIdx=-1, ordersColIdx=-1, impressionsColIdx=-1, ctrColIdx=-1;
+                const headerCols = parseCSVLine(lines[0]);
+                headerCols.forEach((h, i) => {
+                    const hh = h.toLowerCase().trim().replace(/['"]/g,'');
+                    if (hh.includes('total cost') && hh.includes('converted')) spendColIdx = i;
+                    else if (hh === 'total cost' && spendColIdx === -1) spendColIdx = i;
+                    if ((hh === 'sales (converted)' || hh === 'sales') && salesColIdx === -1) salesColIdx = i;
+                    if (hh === 'clicks') clicksColIdx = i;
+                    if (hh === 'purchases' || hh === 'orders') ordersColIdx = i;
+                    if (hh === 'impressions') impressionsColIdx = i;
+                    if (hh === 'ctr') ctrColIdx = i;
+                });
+                // Fallback indexes if header detection fails
+                if (spendColIdx  < 0) spendColIdx  = 15;
+                if (salesColIdx  < 0) salesColIdx  = 21;
+                if (clicksColIdx < 0) clicksColIdx = 13;
+                if (ordersColIdx < 0) ordersColIdx = 19;
+                if (ctrColIdx    < 0) ctrColIdx    = 14;
+
+                for (let i=1;i<lines.length;i++) {
+                    const cols = parseCSVLine(lines[i]);
+                    if (cols.length<12) continue;
+                    const rowClicks = parseInt(cols[clicksColIdx]?.replace(/[^0-9]/g,'')||0);
+                    totalSpend      += parseFloat(cols[spendColIdx]?.replace(/[^0-9.-]/g,'')||0);
+                    totalSales      += parseFloat(cols[salesColIdx]?.replace(/[^0-9.-]/g,'')||0);
+                    totalClicks     += rowClicks;
+                    totalOrders     += parseInt(cols[ordersColIdx]?.replace(/[^0-9]/g,'')||0);
+                    // Impressions — if column exists use it, else calculate from CTR
+                    if (impressionsColIdx >= 0) {
+                        totalImpressions += parseInt(cols[impressionsColIdx]?.replace(/[^0-9]/g,'')||0);
+                    } else if (ctrColIdx >= 0 && rowClicks > 0) {
+                        // CTR = Clicks / Impressions  →  Impressions = Clicks / CTR
+                        const rowCtr = parseFloat(cols[ctrColIdx]?.replace(/[^0-9.-]/g,'')||0);
+                        if (rowCtr > 0) totalImpressions += Math.round(rowClicks / rowCtr);
+                    }
+                }
+                const project = projects.find(p => p.id === currentProjectId);
+                for (const key in pendingBusinessData) {
+                    const biz = pendingBusinessData[key];
+                    const organicSales  = biz.totalSales - totalSales;
+                    // ✅ Total Revenue = Total Sales - PPC Spend
+                    const totalRevenue  = biz.totalSales - totalSpend;
+                    const roas          = totalSpend>0 ? totalSales/totalSpend : 0;
+                    const acos          = totalSales>0 ? totalSpend/totalSales*100 : 0;
+                    // ✅ CTR = Clicks / Impressions (per formula)
+                    const ctr           = totalImpressions>0 ? (totalClicks/totalImpressions)*100 : 0;
+                    const cpc           = totalClicks>0 ? totalSpend/totalClicks : 0;
+                    const convRate      = totalClicks>0 ? totalOrders/totalClicks*100 : 0;
+                    const cpa           = totalOrders>0 ? totalSpend/totalOrders : 0;
+                    const tacos         = biz.totalSales>0 ? totalSpend/biz.totalSales*100 : 0;
+                    const status        = roas>=2 ? "High Sell" : (roas>=1 ? "Stable" : "Starting");
+                    const existingIdx   = monthlyData.findIndex(m => m.projectId===currentProjectId && m.year===biz.year && m.month===biz.month);
+                    const record = {
+                        id: existingIdx>=0 ? monthlyData[existingIdx].id : Date.now()+Math.random(),
+                        projectId:currentProjectId, year:biz.year, month:biz.month, status,
+                        clientCode:project.clientCode, clientName:project.clientName, marketplace:project.primaryMarketplace||"USA",
+                        ppcSpend:totalSpend, ppcSales:totalSales, totalSales:biz.totalSales, organicSales,
+                        totalRevenue,
+                        roas, acos, clicks:totalClicks, ppcOrders:totalOrders, convRate,
+                        impressions:totalImpressions, ctr, cpc, cpa, tacos, allUnitsOrders:biz.unitsOrders,
+                        uploadedBy: currentUser.uid, uploadedAt: new Date().toISOString()
+                    };
+                    if (existingIdx>=0) monthlyData[existingIdx]=record; else monthlyData.push(record);
+                    await saveMonthlyRecord(record);
+                }
+                refreshMonthlyData();
+                document.getElementById("campaignStatus").innerHTML = `✅ Merged! Spend: $${totalSpend.toFixed(2)}, Sales: $${totalSales.toFixed(2)}`;
+                pendingBusinessData = null;
+                alert(`✅ Data saved to cloud!\nTotal PPC Spend: $${totalSpend.toFixed(2)}\nTotal PPC Sales: $${totalSales.toFixed(2)}`);
+            };
+            reader.readAsText(file); input.value="";
+        };
+
+        window.refreshMonthlyData = function() {
+            if (!currentProjectId) return;
+            const year = document.getElementById("yearFilter").value;
+            const monthFilter = document.getElementById("monthFilter").value;
+            const monthOrder = ["January","February","March","April","May","June","July","August","September","October","November","December"];
+            let filtered = monthlyData.filter(d => d.projectId===currentProjectId && d.year===year);
+            if (monthFilter!=="all") filtered = filtered.filter(d => d.month===monthFilter);
+            // ✅ FIX: Sort by year then month in correct calendar order
+            filtered.sort((a,b) => {
+                if (a.year !== b.year) return parseInt(a.year) - parseInt(b.year);
+                return monthOrder.indexOf(a.month) - monthOrder.indexOf(b.month);
+            });
+            renderMonthlyTable(filtered);
+            updateMonthlyStats(filtered);
+            renderMonthlyAlerts(filtered);
+            renderMonthlyCharts(filtered);
+        };
+
+        function renderMonthlyTable(data) {
+            const tbody = document.getElementById("monthlyTableBody");
+            if (data.length===0) { tbody.innerHTML=`<tr><td colspan="22" style="text-align:center;padding:30px;color:#94a3b8;">No data. Upload a CSV or add a manual entry.</td></tr>`; return; }
+            tbody.innerHTML = data.map(item => `<tr>
+                <td>${item.status||'-'}</td><td>${item.month} ${item.year}</td><td>${item.clientCode}</td><td>${item.clientName}</td><td>${item.marketplace||'-'}</td>
+                <td>$${formatNum(item.ppcSpend)}</td><td>$${formatNum(item.ppcSales)}</td><td>$${formatNum(item.totalSales)}</td><td>$${formatNum(item.organicSales)}</td>
+                <td>$${formatNum(item.totalRevenue != null ? item.totalRevenue : item.totalSales)}</td>
+                <td>${item.roas?.toFixed(2)||'-'}</td><td>${item.acos?.toFixed(2)||'-'}%</td><td>${item.clicks||0}</td><td>${item.ppcOrders||0}</td>
+                <td>${item.convRate?.toFixed(2)||'-'}%</td><td>${item.impressions||0}</td><td>${item.ctr?.toFixed(2)||'-'}%</td>
+                <td>$${item.cpc?.toFixed(2)||'-'}</td><td>$${item.cpa?.toFixed(2)||'-'}</td><td>${item.tacos?.toFixed(2)||'-'}%</td><td>${item.allUnitsOrders||0}</td>
+                <td><button class="btn btn-outline" style="padding:2px 8px;" onclick="deleteMonthlyRecord(${item.id})">🗑️</button></td>
+            </tr>`).join('');
+        }
+
+        window.deleteMonthlyRecord = async function(id) {
+            if (!confirm("Delete this record?")) return;
+            monthlyData = monthlyData.filter(d => d.id !== id);
+            await deleteMonthlyFromDB(id);
+            refreshMonthlyData();
+        };
+
+        function updateMonthlyStats(data) {
+            const spend = data.reduce((s,d)=>s+(d.ppcSpend||0),0);
+            const sales = data.reduce((s,d)=>s+(d.totalSales||0),0);
+            const orders = data.reduce((s,d)=>s+(d.allUnitsOrders||0),0);
+            const avgRoas = spend>0?(sales/spend).toFixed(2):0;
+            document.getElementById("monthlyStatsCards").innerHTML = `
+                <div class="stat-card"><h4>Total Revenue</h4><div class="number">$${formatNum(sales)}</div></div>
+                <div class="stat-card"><h4>Ad Spend</h4><div class="number">$${formatNum(spend)}</div></div>
+                <div class="stat-card"><h4>Orders</h4><div class="number">${formatNum(orders)}</div></div>
+                <div class="stat-card"><h4>Avg ROAS</h4><div class="number">${avgRoas}x</div></div>
+                <div class="stat-card"><h4>Records</h4><div class="number">${data.length}</div></div>`;
+        }
+
+        window.openAddManualData = function() { if (!currentProjectId){alert("Please select a project first!");return;} document.getElementById("manualDataModal").style.display="flex"; };
+        window.closeManualModal = function() { document.getElementById("manualDataModal").style.display="none"; };
+        window.saveManualData = async function(e) {
+            e.preventDefault();
+            if (!currentProjectId) return;
+            const project = projects.find(p => p.id===currentProjectId);
+            const year = document.getElementById("manualYear").value;
+            const month = document.getElementById("manualMonth").value;
+            const spend = parseFloat(document.getElementById("manualSpend").value)||0;
+            const ppcSales = parseFloat(document.getElementById("manualPpcSales").value)||0;
+            const totalSales = parseFloat(document.getElementById("manualTotalSales").value)||0;
+            const clicks = parseInt(document.getElementById("manualClicks").value)||0;
+            const orders = parseInt(document.getElementById("manualOrders").value)||0;
+            const impressions = parseInt(document.getElementById("manualImpressions").value)||0;
+            const units = parseInt(document.getElementById("manualUnits").value)||0;
+            const organicSales = totalSales - ppcSales;
+            const roas = spend>0?(ppcSales/spend):0;
+            const acos = ppcSales>0?(spend/ppcSales*100):0;
+            const ctr = impressions>0?(clicks/impressions*100):0;
+            const cpc = clicks>0?(spend/clicks):0;
+            const convRate = clicks>0?(orders/clicks*100):0;
+            const cpa = orders>0?(spend/orders):0;
+            const tacos = totalSales>0?(spend/totalSales*100):0;
+            const status = roas>=2?"High Sell":(roas>=1?"Stable":"Starting");
+            const existingIdx = monthlyData.findIndex(m=>m.projectId===currentProjectId&&m.year===year&&m.month===month);
+            const record = {
+                id: existingIdx>=0?monthlyData[existingIdx].id:Date.now(),
+                projectId:currentProjectId, year, month, status,
+                clientCode:project.clientCode, clientName:project.clientName, marketplace:project.primaryMarketplace||"USA",
+                ppcSpend:spend, ppcSales, totalSales, organicSales, roas, acos, clicks, ppcOrders:orders, convRate,
+                impressions, ctr, cpc, cpa, tacos, allUnitsOrders:units,
+                uploadedBy:currentUser.uid, uploadedAt:new Date().toISOString()
+            };
+            if(existingIdx>=0) monthlyData[existingIdx]=record; else monthlyData.push(record);
+            await saveMonthlyRecord(record);
+            closeManualModal(); refreshMonthlyData(); alert("✅ Manual data saved to cloud!");
+        };
+
+        window.exportMonthlyData = function() {
+            if (!currentProjectId) return;
+            const data = monthlyData.filter(d=>d.projectId===currentProjectId);
+            if (data.length===0){alert("No data");return;}
+            const headers = ["Status","Month","Year","Client Code","Client Name","Marketplace","PPC Spend","PPC Sales","Total Sales","Organic Sales","Total Revenue","Overall ROAS","ACOS%","Clicks","PPC Orders","Conv Rate%","Impressions","CTR%","CPC Avg","CPA","TACoS%","Units Orders"];
+            const rows = [headers, ...data.map(i=>[i.status,i.month,i.year,i.clientCode,i.clientName,i.marketplace,i.ppcSpend,i.ppcSales,i.totalSales,i.organicSales,(i.totalRevenue!=null?i.totalRevenue:i.totalSales),i.roas,i.acos,i.clicks,i.ppcOrders,i.convRate,i.impressions,i.ctr,i.cpc,i.cpa,i.tacos,i.allUnitsOrders])];
+            downloadCSV(rows, "monthly_report.csv");
+        };
+
+        // ========== CAMPAIGN TRACKER ==========
+        // Sequential Campaign ID counter per project
+        function getNextCampaignSeq(projectId) {
+            const existing = campaignData.filter(c=>c.projectId===projectId);
+            if (existing.length===0) return 1;
+            const nums = existing.map(c=>{
+                const m = String(c.campaignId||"").match(/(\d+)$/);
+                return m ? parseInt(m[1]) : 0;
+            });
+            return Math.max(...nums) + 1;
+        }
+        function formatCampaignId(projectId, seq) {
+            const proj = projects.find(p=>p.id===projectId);
+            const code = proj ? proj.clientCode : "CMP";
+            return `${code}-${String(seq).padStart(3,'0')}`;
+        }
+
+        window.onCampaignProjectChange = function() {
+            const sel = document.getElementById("projectSelectCampaign");
+            currentCampaignProjectId = sel.value ? parseInt(sel.value) : null;
+            const area = document.getElementById("campaignUploadArea");
+            if (currentCampaignProjectId) { area.style.display="block"; filterCampaignData(); }
+            else area.style.display="none";
+        };
+
+        window.deleteCampaignRecord = async function(campaignId) {
+            if (!confirm("Delete this campaign record?")) return;
+            campaignData = campaignData.filter(c=>c.campaignId!==campaignId);
+            await db.collection("campaignData").doc(campaignId).delete();
+            filterCampaignData();
+            showSync("🗑️ Campaign deleted!");
+        };
+
+        window.processCampaignTrackerData = function(input) {
+            const file = input.files[0]; if (!file) return;
+            const projectId = document.getElementById("projectSelectCampaign").value;
+            if (!projectId){alert("Please select a project first!"); input.value=""; return;}
+            input.value="";
+            openMonthSelector(async function(selectedMonth, selectedYear) {
+                const project = projects.find(p=>p.id==projectId);
+                const reader = new FileReader();
+                reader.onload = async function(e) {
+                    const lines = e.target.result.split(/\r?\n/);
+                    // Auto-detect columns from header
+                    const hdr = parseCSVLine(lines[0]);
+                    let ci={name:1,state:0,status:3,type:4,targeting:5,bidding:6,startDate:7,budget:9,impressions:-1,clicks:13,ctr:14,spend:15,cpc:18,orders:19,sales:21,acos:22,roas:23};
+                    hdr.forEach((h,i)=>{
+                        const hh=h.toLowerCase().trim().replace(/['"]/g,'');
+                        if(hh==='campaign name') ci.name=i;
+                        if(hh==='state') ci.state=i;
+                        if(hh==='status') ci.status=i;
+                        if(hh==='type') ci.type=i;
+                        if(hh==='targeting') ci.targeting=i;
+                        if(hh.includes('bid strategy')) ci.bidding=i;
+                        if(hh.includes('start date')) ci.startDate=i;
+                        if(hh.includes('budget amount')&&hh.includes('converted')) ci.budget=i;
+                        if(hh==='impressions') ci.impressions=i;
+                        if(hh==='clicks') ci.clicks=i;
+                        if(hh==='ctr') ci.ctr=i;
+                        if(hh.includes('total cost')&&hh.includes('converted')) ci.spend=i;
+                        if(hh==='cpc (converted)'||hh==='cpc') ci.cpc=i;
+                        if(hh==='purchases'||hh==='orders') ci.orders=i;
+                        if(hh==='sales (converted)'||hh==='sales') { if(ci.sales===-1||hh==='sales (converted)') ci.sales=i; }
+                        if(hh==='acos') ci.acos=i;
+                        if(hh==='roas') ci.roas=i;
+                    });
+
+                    // Remove old records for this project+month+year before re-uploading
+                    const oldKeys = campaignData.filter(c=>c.projectId==project.id&&c.month===selectedMonth&&c.year===selectedYear).map(c=>c.campaignId);
+                    for(const k of oldKeys) { try{ await db.collection("campaignData").doc(k).delete(); }catch(e){} }
+                    campaignData = campaignData.filter(c=>!(c.projectId==project.id&&c.month===selectedMonth&&c.year===selectedYear));
+
+                    let seq = getNextCampaignSeq(project.id);
+                    const newCampaigns = [];
+                    for (let i=1;i<lines.length;i++) {
+                        const cols = parseCSVLine(lines[i]);
+                        if (cols.length<10) continue;
+                        const name = (cols[ci.name]||"").replace(/"/g,'').trim();
+                        if (!name||name==="Unknown"||name==="Campaign name") continue;
+                        const spend   = parseFloat(cols[ci.spend]?.replace(/[^0-9.-]/g,'')||0);
+                        const sales   = parseFloat(cols[ci.sales]?.replace(/[^0-9.-]/g,'')||0);
+                        const clicks  = parseInt(cols[ci.clicks]?.replace(/[^0-9]/g,'')||0);
+                        const orders  = parseInt(cols[ci.orders]?.replace(/[^0-9]/g,'')||0);
+                        const budget  = parseFloat(cols[ci.budget]?.replace(/[^0-9.-]/g,'')||0);
+                        const launchDate = (cols[ci.startDate]||"").replace(/"/g,'').trim();
+                        const campaignStatus = (cols[ci.status]||"").replace(/"/g,'').trim();
+                        const biddingStrategy = (cols[ci.bidding]||"").replace(/"/g,'').trim();
+
+                        // Impressions: use column if exists, else calc from CTR
+                        let impressions = 0;
+                        if (ci.impressions>=0) {
+                            impressions = parseInt(cols[ci.impressions]?.replace(/[^0-9]/g,'')||0);
+                        }
+                        if (impressions===0 && ci.ctr>=0 && clicks>0) {
+                            const rowCtr = parseFloat(cols[ci.ctr]?.replace(/[^0-9.-]/g,'')||0);
+                            if (rowCtr>0) impressions = Math.round(clicks/rowCtr);
+                        }
+
+                        if (impressions===0&&clicks===0&&spend===0) continue;
+
+                        const roas     = spend>0 ? sales/spend : 0;
+                        const acos     = sales>0 ? (spend/sales)*100 : 0;
+                        const ctr      = impressions>0 ? (clicks/impressions)*100 : 0;
+                        const cpc      = clicks>0 ? spend/clicks : 0;
+                        const convRate = clicks>0 ? (orders/clicks)*100 : 0;
+                        const revenue  = sales - spend;
+                        const campaignType  = (cols[ci.type]||"SP").replace(/"/g,'').trim() || (/\bsd\b/i.test(name)?"SD":"SP");
+                        const targeting     = (cols[ci.targeting]||"").replace(/"/g,'').trim() || (/\bauto\b/i.test(name)?"AUTOMATIC":"MANUAL");
+
+                        const record = {
+                            campaignId: formatCampaignId(project.id, seq++),
+                            projectId:project.id, clientCode:project.clientCode, marketplace:project.primaryMarketplace||"USA",
+                            funnelStage:getFunnelStage(name), campaignType, targeting, biddingStrategy,
+                            campaignName:name, campaignStatus, launchDate, dailyBudget:budget,
+                            impressions, clicks, ctr, actualSpend:spend, cpc, orders, sales, acos, roas, revenue, convRate,
+                            campaignPerformance:getCampaignPerformance(orders,spend,sales),
+                            month:selectedMonth, year:selectedYear, uploadedBy:currentUser.uid
+                        };
+                        newCampaigns.push(record);
+                    }
+                    if (newCampaigns.length>0) {
+                        campaignData.push(...newCampaigns);
+                        await saveCampaignRecord(newCampaigns);
+                        filterCampaignData();
+                        document.getElementById("campaignUploadStatus").innerHTML = `✅ ${newCampaigns.length} campaigns loaded for ${selectedMonth} ${selectedYear}`;
+                        alert(`✅ ${newCampaigns.length} campaigns saved to cloud for ${selectedMonth} ${selectedYear}!`);
+                    } else alert("No valid campaigns found in CSV");
+                };
+                reader.readAsText(file);
+            });
+        };
+
+        window.filterCampaignData = function() {
+            if (!currentCampaignProjectId) return;
+            const monthFilter   = document.getElementById("campaignMonthFilter").value;
+            const statusFilter  = (document.getElementById("campaignStatusFilter")?.value||"all");
+            const typeFilter    = (document.getElementById("campaignTypeFilter")?.value||"all");
+            const targetFilter  = (document.getElementById("campaignTargetFilter")?.value||"all");
+            const funnelFilter  = (document.getElementById("campaignFunnelFilter")?.value||"all");
+            const perfFilter    = (document.getElementById("campaignPerfFilter")?.value||"all");
+            const searchVal     = (document.getElementById("campaignSearch")?.value||"").toLowerCase();
+            let filtered = campaignData.filter(c=>c.projectId===currentCampaignProjectId);
+            if (monthFilter!=="all")  filtered = filtered.filter(c=>c.month===monthFilter);
+            if (statusFilter!=="all") filtered = filtered.filter(c=>(c.campaignStatus||"").includes(statusFilter));
+            if (typeFilter!=="all")   filtered = filtered.filter(c=>(c.campaignType||"SP")===typeFilter);
+            if (targetFilter!=="all") filtered = filtered.filter(c=>(c.targeting||"")===targetFilter);
+            if (funnelFilter!=="all") filtered = filtered.filter(c=>(c.funnelStage||"")===funnelFilter);
+            if (perfFilter!=="all")   filtered = filtered.filter(c=>(c.campaignPerformance||"")===perfFilter);
+            if (searchVal) filtered = filtered.filter(c=>(c.campaignName||"").toLowerCase().includes(searchVal));
+            renderCampaignTable(filtered);
+            updateCampaignStats(filtered);
+            renderCampaignAlerts(filtered);
+        };
+
+        function renderCampaignTable(data) {
+            const tbody = document.getElementById("campaignTableBody");
+            if (data.length===0){tbody.innerHTML='<tr><td colspan="24" style="text-align:center;padding:30px;color:#94a3b8;">No campaign data. Upload CSV.</td></tr>';return;}
+            const perfClass = p=>p==='Stop Campaign'?'performance-stop':p==='New Campaign'?'performance-new':p==='Good'?'performance-good':p==='Medium'?'performance-medium':'performance-high';
+            tbody.innerHTML = data.map(c=>`<tr>
+                <td><small style="font-weight:700;color:#2a5298;">${c.campaignId}</small></td>
+                <td>${c.clientCode}</td>
+                <td>${c.marketplace}</td>
+                <td>${c.funnelStage}</td>
+                <td><span style="background:#dbeafe;color:#1e40af;padding:2px 7px;border-radius:10px;font-size:10px;">${c.campaignStatus||'-'}</span></td>
+                <td>${c.campaignType||'SP'}</td>
+                <td>${c.targeting||'MANUAL'}</td>
+                <td style="font-size:10px;color:#64748b;">${c.biddingStrategy||'-'}</td>
+                <td title="${c.campaignName}" style="max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${c.campaignName}</td>
+                <td>${c.launchDate||'-'}</td>
+                <td>$${(c.dailyBudget||0).toFixed(2)}</td>
+                <td>${(c.impressions||0).toLocaleString()}</td>
+                <td>${(c.clicks||0).toLocaleString()}</td>
+                <td>${(c.ctr||0).toFixed(2)}%</td>
+                <td>$${(c.actualSpend||0).toFixed(2)}</td>
+                <td>$${(c.cpc||0).toFixed(2)}</td>
+                <td>${c.orders||0}</td>
+                <td>$${(c.sales||0).toFixed(2)}</td>
+                <td>${(c.acos||0).toFixed(1)}%</td>
+                <td>${(c.roas||0).toFixed(2)}x</td>
+                <td>${(c.convRate||0).toFixed(1)}%</td>
+                <td style="color:${(c.revenue||0)>=0?'#10b981':'#ef4444'};font-weight:700;">$${(c.revenue||0).toFixed(2)}</td>
+                <td><span class="${perfClass(c.campaignPerformance)}">${c.campaignPerformance}</span></td>
+                <td>
+                    <button class="btn btn-outline" style="padding:2px 8px;background:#fee2e2;color:#dc2626;font-size:11px;" onclick="deleteCampaignRecord('${c.campaignId}')">🗑️</button>
+                </td>
+            </tr>`).join('');
+        }
+
+        function updateCampaignStats(data) {
+            const spend=data.reduce((s,c)=>s+(c.actualSpend||0),0);
+            const sales=data.reduce((s,c)=>s+(c.sales||0),0);
+            const orders=data.reduce((s,c)=>s+(c.orders||0),0);
+            const avgRoas=spend>0?(sales/spend).toFixed(2):0;
+            document.getElementById("campaignStatsCards").innerHTML = `
+                <div class="campaign-stat-card"><div class="number">$${spend.toLocaleString()}</div><div>Spend</div></div>
+                <div class="campaign-stat-card"><div class="number">$${sales.toLocaleString()}</div><div>Sales</div></div>
+                <div class="campaign-stat-card"><div class="number">${orders.toLocaleString()}</div><div>Orders</div></div>
+                <div class="campaign-stat-card"><div class="number">${avgRoas}x</div><div>Avg ROAS</div></div>
+                <div class="campaign-stat-card"><div class="number">${data.length}</div><div>Campaigns</div></div>`;
+        }
+
+        window.exportCampaignData = function() {
+            if (!currentCampaignProjectId) return;
+            const data = campaignData.filter(c=>c.projectId===currentCampaignProjectId);
+            if (data.length===0){alert("No data");return;}
+            const headers = ["Campaign_ID","Client_Code","Marketplace","Funnel_Stage","Campaign_Type","Targeting","Campaign_Name","Impressions","Clicks","CTR%","Actual_Spend","CPC","Orders","Sales","ACOS%","ROAS","Revenue","Conv_Rate%","Campaign_Performance","Month","Year"];
+            const rows = [headers, ...data.map(c=>[c.campaignId,c.clientCode,c.marketplace,c.funnelStage,c.campaignType||'SP',c.targeting||'MANUAL',c.campaignName,c.impressions,c.clicks,c.ctr?(c.ctr*100).toFixed(2):'0',c.actualSpend?.toFixed(2),c.cpc?.toFixed(2),c.orders,c.sales?.toFixed(2),c.acos?(c.acos*100).toFixed(1):'0',c.roas?.toFixed(2),c.revenue?.toFixed(2),c.convRate?(c.convRate*100).toFixed(1):'0',c.campaignPerformance,c.month,c.year||''])];
+            downloadCSV(rows, "campaigns_export.csv");
+        };
+
+        // ========== WEEKLY TRACKING ==========
+        window.onWeeklyProjectChange = function() {
+            const sel = document.getElementById("projectSelectWeekly");
+            currentWeeklyProjectId = sel.value ? parseInt(sel.value) : null;
+            const info = document.getElementById("weeklyProjectInfo");
+            const content = document.getElementById("weeklyContent");
+            if (currentWeeklyProjectId) {
+                const p = projects.find(p=>p.id===currentWeeklyProjectId);
+                info.innerHTML = `✅ ${p.clientCode} - ${p.clientName}`;
+                content.style.display = "block";
+                const today = new Date().toISOString().slice(0,10);
+                document.getElementById("weekEndingDate").value = today;
+                document.getElementById("weekStartDate").value = getWeekStart(today);
+                onWeekDateChange();
+                renderSavedWeeksBadges();
+            } else { info.innerHTML=""; content.style.display="none"; }
+        };
+
+        window.onWeekDateChange = function() {
+            const endDate = document.getElementById("weekEndingDate").value;
+            const startDate = document.getElementById("weekStartDate").value;
+            if (!endDate && !startDate) return;
+            if (endDate && !startDate) document.getElementById("weekStartDate").value = getWeekStart(endDate);
+            if (startDate && !endDate) {
+                const d = new Date(startDate); d.setDate(d.getDate()+6);
+                document.getElementById("weekEndingDate").value = d.toISOString().slice(0,10);
+            }
+            const finalEnd = document.getElementById("weekEndingDate").value;
+            const finalStart = document.getElementById("weekStartDate").value;
+            currentWeekEnding = finalEnd;
+            if (finalStart && finalEnd) {
+                const badge = document.getElementById("weekRangeBadge");
+                badge.textContent = `📅 ${formatDateDisplay(finalStart)} → ${formatDateDisplay(finalEnd)}`;
+                badge.style.display = "inline-block";
+            }
+            renderWeeklyData();
+            renderSavedWeeksBadges();
+        };
+
+        window.uploadWeeklyCSV = async function(input) {
+            const file = input.files[0]; if (!file) return;
+            if (!currentWeeklyProjectId){alert("Please select a project first!");input.value="";return;}
+            const endDate = document.getElementById("weekEndingDate").value;
+            const startDate = document.getElementById("weekStartDate").value;
+            if (!endDate||!startDate){alert("Please select both Start and End dates first!");input.value="";return;}
+            input.value="";
+            const project = projects.find(p=>p.id===currentWeeklyProjectId);
+            const reader = new FileReader();
+            reader.onload = async function(e) {
+                const lines = e.target.result.split(/\r?\n/);
+                if (lines.length<2){alert("CSV file is empty!");return;}
+
+                // Auto-detect columns from header row (Amazon Campaign Report format)
+                const hdr = parseCSVLine(lines[0]);
+                let ci = { state:0, name:1, status:3, type:4, targeting:5, bidding:6, startDate:7, budget:9,
+                           impressions:12, ctr:16, clicks:15, spend:17, cpc:20, orders:21, sales:23, acos:24, roas:25 };
+                hdr.forEach((h,i)=>{
+                    const hh = h.toLowerCase().trim().replace(/['"]/g,'');
+                    if (hh==='state') ci.state=i;
+                    if (hh==='campaign name') ci.name=i;
+                    if (hh==='status') ci.status=i;
+                    if (hh==='type') ci.type=i;
+                    if (hh==='targeting') ci.targeting=i;
+                    if (hh.includes('bid strategy')) ci.bidding=i;
+                    if (hh.includes('start date')) ci.startDate=i;
+                    if (hh.includes('budget amount')&&hh.includes('converted')) ci.budget=i;
+                    if (hh==='impressions') ci.impressions=i;
+                    if (hh==='clicks') ci.clicks=i;
+                    if (hh==='ctr') ci.ctr=i;
+                    if (hh.includes('total cost')&&hh.includes('converted')) ci.spend=i;
+                    if (hh==='cpc (converted)'||hh==='cpc') ci.cpc=i;
+                    if (hh==='purchases'||hh==='orders') ci.orders=i;
+                    if (hh==='sales (converted)') ci.sales=i;
+                    if (hh==='acos') ci.acos=i;
+                    if (hh==='roas') ci.roas=i;
+                });
+
+                const rows = [];
+                for (let i=1;i<lines.length;i++) {
+                    const line = lines[i].trim(); if (!line) continue;
+                    const cols = parseCSVLine(line);
+                    if (cols.length<10) continue;
+
+                    const campaignName = (cols[ci.name]||"").replace(/"/g,'').trim();
+                    if (!campaignName || campaignName==='Campaign name') continue;
+
+                    const state    = (cols[ci.state]||"").replace(/"/g,'').trim();
+                    const type     = (cols[ci.type]||"SP").replace(/"/g,'').trim();
+                    const targeting= (cols[ci.targeting]||"MANUAL").replace(/"/g,'').trim();
+                    const bidding  = (cols[ci.bidding]||"").replace(/"/g,'').trim();
+                    const budget   = parseFloat(cols[ci.budget]?.replace(/[^0-9.-]/g,'')||0);
+                    const launchDate=(cols[ci.startDate]||"").replace(/"/g,'').trim();
+
+                    // Raw values from CSV
+                    let impressions= parseInt(cols[ci.impressions]?.replace(/[^0-9]/g,'')||0);
+                    const clicks   = parseInt(cols[ci.clicks]?.replace(/[^0-9]/g,'')||0);
+                    const spend    = parseFloat(cols[ci.spend]?.replace(/[^0-9.-]/g,'')||0);
+                    const orders   = parseInt(cols[ci.orders]?.replace(/[^0-9]/g,'')||0);
+                    const sales    = parseFloat(cols[ci.sales]?.replace(/[^0-9.-]/g,'')||0);
+
+                    // If no impressions col, calc from CTR
+                    if (impressions===0 && clicks>0) {
+                        const rawCtr = parseFloat(cols[ci.ctr]?.replace(/[^0-9.-]/g,'')||0);
+                        if (rawCtr>0) impressions = Math.round(clicks/rawCtr);
+                    }
+
+                    // Skip only completely empty/header rows
+                    if (!campaignName) continue;
+
+                    // ✅ Auto-calculate all metrics (same formulas as Excel sheet)
+                    const ctr      = impressions>0 ? (clicks/impressions)*100 : 0;           // CTR = Clicks/Impressions
+                    const cpc      = clicks>0 ? spend/clicks : 0;                            // CPC = Spend/Clicks
+                    const acos     = sales>0 ? (spend/sales)*100 : 0;                        // ACOS = Spend/Sales
+                    const roas     = spend>0 ? sales/spend : 0;                              // ROAS = Sales/Spend
+                    const convRate = clicks>0 ? (orders/clicks)*100 : 0;                     // Conv% = Orders/Clicks
+                    const revenue  = sales - spend;                                           // Revenue = Sales - Spend
+
+                    // ✅ Status logic (same as Excel sheet)
+                    let status = '';
+                    let notes  = '';
+                    if (spend===0 && clicks===0) {
+                        status = 'Check Targeting & Adjust Bid';
+                        notes  = 'No spend or clicks — review targeting';
+                    } else if (roas >= 10) {
+                        status = 'Good'; notes = 'Excellent ROAS — consider scaling budget';
+                    } else if (roas >= 4) {
+                        status = 'Good'; notes = '';
+                    } else if (roas >= 2) {
+                        status = 'Medium'; notes = 'Acceptable — optimize keywords';
+                    } else if (roas > 0 && roas < 2) {
+                        status = 'High'; notes = 'High ACOS — review bids & targeting';
+                    } else if (spend > 0 && orders===0) {
+                        status = 'Decrease Bids & Adjust placements';
+                        notes  = 'Spend with no orders — reduce bids';
+                    } else {
+                        status = 'Check Targeting & Adjust Bid'; notes = '';
+                    }
+
+                    rows.push({ campaignName, state, type, targeting, bidding, budget, launchDate,
+                                impressions, clicks, ctr, spend, cpc, orders, sales, acos, roas, convRate, revenue, status, notes });
+                }
+
+                if (rows.length===0){alert("No active campaign data found in CSV!");return;}
+
+                const weekRecord = {
+                    projectId:currentWeeklyProjectId, clientCode:project.clientCode,
+                    marketplace:project.primaryMarketplace||"USA",
+                    weekEnding:endDate, weekStart:startDate, rows,
+                    uploadedBy:currentUser.uid, uploadedAt:new Date().toISOString()
+                };
+                const existingIdx = weeklyData.findIndex(w=>w.projectId===currentWeeklyProjectId&&w.weekEnding===endDate);
+                if (existingIdx>=0) weeklyData[existingIdx]=weekRecord; else weeklyData.push(weekRecord);
+                await saveWeeklyRecord(weekRecord);
+                currentWeekEnding = endDate;
+                renderWeeklyData();
+                renderSavedWeeksBadges();
+                document.getElementById("weeklyUploadStatus").innerHTML = `✅ ${rows.length} campaigns loaded!`;
+                alert(`✅ ${rows.length} campaigns saved for ${formatDateDisplay(startDate)} → ${formatDateDisplay(endDate)}!`);
+            };
+            reader.readAsText(file);
+        };
+
+        function renderSavedWeeksBadges() {
+            if (!currentWeeklyProjectId) return;
+            const row = document.getElementById("savedWeeksRow");
+            const div = document.getElementById("savedWeeksBadges");
+            if (!row||!div) return;
+            const weeks = weeklyData.filter(w=>w.projectId===currentWeeklyProjectId);
+            if (weeks.length===0){row.style.display="none";return;}
+            row.style.display="flex";
+            weeks.sort((a,b)=>new Date(b.weekEnding)-new Date(a.weekEnding));
+            div.innerHTML = weeks.map(w=>{
+                const isActive = w.weekEnding===currentWeekEnding;
+                return `<button onclick="loadSavedWeek('${w.weekStart}','${w.weekEnding}')" style="padding:4px 12px;border-radius:16px;border:1.5px solid ${isActive?'#2a5298':'#e2e8f0'};background:${isActive?'#2a5298':'white'};color:${isActive?'white':'#475569'};font-size:11px;cursor:pointer;white-space:nowrap;">
+                    ${formatDateDisplay(w.weekStart)} → ${formatDateDisplay(w.weekEnding)} <span style="opacity:0.7">(${w.rows.length})</span>
+                </button>`;
+            }).join('');
+        }
+
+        window.loadSavedWeek = function(startDate, endDate) {
+            document.getElementById("weekStartDate").value = startDate;
+            document.getElementById("weekEndingDate").value = endDate;
+            currentWeekEnding = endDate;
+            const badge = document.getElementById("weekRangeBadge");
+            badge.textContent = `📅 ${formatDateDisplay(startDate)} → ${formatDateDisplay(endDate)}`;
+            badge.style.display = "inline-block";
+            renderWeeklyData();
+            renderSavedWeeksBadges();
+        };
+
+        window.deleteCurrentWeek = async function() {
+            if (!currentWeeklyProjectId||!currentWeekEnding) return;
+            if (!confirm(`Delete week ending ${formatDateDisplay(currentWeekEnding)}?`)) return;
+            weeklyData = weeklyData.filter(w=>!(w.projectId===currentWeeklyProjectId&&w.weekEnding===currentWeekEnding));
+            await deleteWeeklyFromDB(currentWeeklyProjectId, currentWeekEnding);
+            currentWeekEnding=null;
+            document.getElementById("weekEndingDate").value="";
+            document.getElementById("weekStartDate").value="";
+            document.getElementById("weekRangeBadge").textContent="";
+            document.getElementById("weekRangeBadge").style.display="none";
+            document.getElementById("weeklyUploadStatus").textContent="";
+            renderWeeklyData();
+            renderSavedWeeksBadges();
+            alert("Week deleted!");
+        };
+        function renderWeeklyData() {
+            if (!currentWeeklyProjectId||!currentWeekEnding) return;
+            const weekRecord = weeklyData.find(w=>w.projectId===currentWeeklyProjectId&&w.weekEnding===currentWeekEnding);
+            const tbody = document.getElementById("weeklyTableBody");
+            const statsDiv = document.getElementById("weeklyStatsCards");
+            if (!weekRecord||weekRecord.rows.length===0) {
+                tbody.innerHTML=`<tr><td colspan="21" class="no-weeks-msg"><div style="font-size:3rem;">📭</div><p>No data for this week.<br>Upload the Amazon Campaign CSV to get started.</p></td></tr>`;
+                statsDiv.innerHTML=''; return;
+            }
+            const rows = weekRecord.rows;
+
+            // ── Apply filters FIRST ──
+            const stateF  = document.getElementById("weeklyStateFilter")?.value  || "all";
+            const typeF   = document.getElementById("weeklyTypeFilter")?.value   || "all";
+            const targetF = document.getElementById("weeklyTargetFilter")?.value || "all";
+            const statusF = document.getElementById("weeklyStatusFilter")?.value || "all";
+            const searchF = (document.getElementById("weeklySearch")?.value || "").toLowerCase();
+
+            const dispRows = rows.filter(r => {
+                if (stateF  !== "all" && (r.state||"").toUpperCase() !== stateF) return false;
+                if (typeF   !== "all" && (r.type||"SP") !== typeF) return false;
+                if (targetF !== "all" && (r.targeting||"") !== targetF) return false;
+                if (statusF !== "all" && !(r.status||"").toLowerCase().includes(statusF.toLowerCase())) return false;
+                if (searchF && !(r.campaignName||"").toLowerCase().includes(searchF)) return false;
+                return true;
+            });
+
+            // ── Summary totals (filtered) ──
+            const totalSpend   = dispRows.reduce((s,r)=>s+(r.spend||0),0);
+            const totalSales   = dispRows.reduce((s,r)=>s+(r.sales||0),0);
+            const totalOrders  = dispRows.reduce((s,r)=>s+(r.orders||0),0);
+            const totalImpr    = dispRows.reduce((s,r)=>s+(r.impressions||0),0);
+            const totalClicks  = dispRows.reduce((s,r)=>s+(r.clicks||0),0);
+            const totalRevenue = totalSales - totalSpend;
+            const avgRoas      = totalSpend>0 ? totalSales/totalSpend : 0;
+            const avgAcos      = totalSales>0 ? (totalSpend/totalSales)*100 : 0;
+            const avgCtr       = totalImpr>0  ? (totalClicks/totalImpr)*100 : 0;
+            const avgCpc       = totalClicks>0? totalSpend/totalClicks : 0;
+            const avgConv      = totalClicks>0? (totalOrders/totalClicks)*100 : 0;
+
+            // ── Stat cards ──
+            statsDiv.innerHTML = `
+                <div class="wstat-card"><div class="wnum">$${totalSpend.toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2})}</div><div class="wlabel">💸 Total Spend</div></div>
+                <div class="wstat-card"><div class="wnum">$${totalSales.toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2})}</div><div class="wlabel">🛒 Total Sales</div></div>
+                <div class="wstat-card"><div class="wnum">${totalOrders.toLocaleString()}</div><div class="wlabel">📦 Orders</div></div>
+                <div class="wstat-card"><div class="wnum">${avgRoas.toFixed(2)}x</div><div class="wlabel">📈 ROAS</div></div>
+                <div class="wstat-card"><div class="wnum">${avgAcos.toFixed(1)}%</div><div class="wlabel">🎯 ACOS</div></div>
+                <div class="wstat-card"><div class="wnum">${totalImpr.toLocaleString()}</div><div class="wlabel">👁️ Impressions</div></div>
+                <div class="wstat-card"><div class="wnum">${totalClicks.toLocaleString()}</div><div class="wlabel">🖱️ Clicks</div></div>
+                <div class="wstat-card"><div class="wnum">${avgCtr.toFixed(2)}%</div><div class="wlabel">📊 CTR</div></div>
+                <div class="wstat-card"><div class="wnum">$${avgCpc.toFixed(2)}</div><div class="wlabel">💰 Avg CPC</div></div>
+                <div class="wstat-card"><div class="wnum">${avgConv.toFixed(1)}%</div><div class="wlabel">🔄 Conv Rate</div></div>
+                <div class="wstat-card" style="background:linear-gradient(135deg,${totalRevenue>=0?'#065f46,#10b981':'#991b1b,#ef4444'})">
+                    <div class="wnum">$${totalRevenue.toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2})}</div><div class="wlabel">💵 Net Revenue</div>
+                </div>
+                <div class="wstat-card" style="background:linear-gradient(135deg,#78350f,#d97706)"><div class="wnum">${dispRows.length} / ${rows.length}</div><div class="wlabel">🎯 Campaigns</div></div>`;
+
+            // ── Status / Campaign State badge helpers ──
+            const stateBadge = s => {
+                const su = (s||"").toUpperCase();
+                if (su==="ENABLED")  return `<span style="background:#d1fae5;color:#065f46;padding:3px 8px;border-radius:10px;font-size:10px;font-weight:700;">✅ ENABLED</span>`;
+                if (su==="PAUSED")   return `<span style="background:#fef3c7;color:#92400e;padding:3px 8px;border-radius:10px;font-size:10px;font-weight:700;">⏸️ PAUSED</span>`;
+                if (su==="ARCHIVED") return `<span style="background:#f1f5f9;color:#64748b;padding:3px 8px;border-radius:10px;font-size:10px;font-weight:700;">📦 ARCHIVED</span>`;
+                return `<span style="background:#f1f5f9;color:#475569;padding:3px 8px;border-radius:10px;font-size:10px;">${s||'-'}</span>`;
+            };
+            const statusBadge = s => {
+                if (!s) return '<span>-</span>';
+                const sl = s.toLowerCase();
+                if (sl==='good')             return `<span style="background:#d1fae5;color:#065f46;padding:3px 9px;border-radius:12px;font-size:10px;font-weight:700;white-space:nowrap;">✅ Good</span>`;
+                if (sl==='medium')           return `<span style="background:#fef3c7;color:#92400e;padding:3px 9px;border-radius:12px;font-size:10px;font-weight:700;white-space:nowrap;">⚠️ Medium</span>`;
+                if (sl==='high')             return `<span style="background:#fee2e2;color:#991b1b;padding:3px 9px;border-radius:12px;font-size:10px;font-weight:700;white-space:nowrap;">🔴 High</span>`;
+                if (sl.includes('decrease')) return `<span style="background:#ede9fe;color:#6d28d9;padding:3px 9px;border-radius:12px;font-size:10px;font-weight:700;white-space:nowrap;">🔻 Decrease Bids</span>`;
+                if (sl.includes('check'))    return `<span style="background:#dbeafe;color:#1e40af;padding:3px 9px;border-radius:12px;font-size:10px;font-weight:700;white-space:nowrap;">🔍 Check Targeting</span>`;
+                return `<span style="background:#f1f5f9;color:#475569;padding:3px 9px;border-radius:12px;font-size:10px;">${s}</span>`;
+            };
+
+            if (dispRows.length===0) {
+                tbody.innerHTML=`<tr><td colspan="21" style="text-align:center;padding:30px;color:#94a3b8;">No campaigns match the selected filters.</td></tr>`;
+                return;
+            }
+
+            // ── Table rows (filtered) ──
+            tbody.innerHTML = dispRows.map((r,i)=>`<tr style="background:${i%2===0?'#fff':'#f8fafc'};">
+                <td style="font-weight:600;color:#94a3b8;text-align:center;">${i+1}</td>
+                <td>${stateBadge(r.state)}</td>
+                <td style="font-weight:600;color:#1e293b;" title="${r.campaignName}">${r.campaignName}</td>
+                <td><span style="background:#dbeafe;color:#1e40af;padding:2px 7px;border-radius:8px;font-size:10px;font-weight:700;">${r.type||'SP'}</span></td>
+                <td><span style="background:${r.targeting==='AUTOMATIC'?'#d1fae5':'#ede9fe'};color:${r.targeting==='AUTOMATIC'?'#065f46':'#6d28d9'};padding:2px 7px;border-radius:8px;font-size:10px;font-weight:700;">${r.targeting||'-'}</span></td>
+                <td style="font-size:10px;color:#64748b;">${r.bidding||'-'}</td>
+                <td style="font-weight:700;">$${(r.budget||0).toFixed(0)}</td>
+                <td>${(r.impressions||0).toLocaleString()}</td>
+                <td style="font-weight:600;">${(r.clicks||0).toLocaleString()}</td>
+                <td>${(r.ctr||0).toFixed(2)}%</td>
+                <td style="font-weight:700;color:#dc2626;">$${(r.spend||0).toFixed(2)}</td>
+                <td>$${(r.cpc||0).toFixed(2)}</td>
+                <td style="font-weight:700;">${r.orders||0}</td>
+                <td style="font-weight:700;color:#10b981;">$${(r.sales||0).toFixed(2)}</td>
+                <td style="color:${(r.acos||0)>40?'#dc2626':(r.acos||0)>20?'#d97706':'#10b981'};font-weight:700;">${(r.acos||0).toFixed(2)}%</td>
+                <td style="color:${(r.roas||0)>=4?'#10b981':(r.roas||0)>=2?'#d97706':'#dc2626'};font-weight:700;">${(r.roas||0).toFixed(2)}x</td>
+                <td>${(r.convRate||0).toFixed(2)}%</td>
+                <td style="font-weight:700;color:${(r.revenue||0)>=0?'#10b981':'#dc2626'};">$${(r.revenue||0).toFixed(2)}</td>
+                <td>${statusBadge(r.status)}</td>
+                <td style="font-size:10px;color:#64748b;max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${r.notes||''}">${r.notes||'-'}</td>
+            </tr>`).join('');
+        }
+
+        window.exportWeeklyData = function() {
+            if (!currentWeeklyProjectId||!currentWeekEnding) return;
+            const weekRecord = weeklyData.find(w=>w.projectId===currentWeeklyProjectId&&w.weekEnding===currentWeekEnding);
+            if (!weekRecord||weekRecord.rows.length===0){alert("No data");return;}
+            const headers = ["Week_Start","Week_Ending","Client_Code","Marketplace","Campaign_Name","Campaign_Type","Targeting","Bidding_Strategy","Budget","Impressions","Clicks","CTR_%","Spend","CPC","Orders","Sales","ACOS_%","ROAS","Conv_Rate_%","Revenue","Status","Notes"];
+            const rows = [headers, ...weekRecord.rows.map(r=>[
+                weekRecord.weekStart, weekRecord.weekEnding, weekRecord.clientCode, weekRecord.marketplace,
+                r.campaignName, r.type||'SP', r.targeting, r.bidding, r.budget,
+                r.impressions, r.clicks, (r.ctr||0).toFixed(2),
+                (r.spend||0).toFixed(2), (r.cpc||0).toFixed(2), r.orders,
+                (r.sales||0).toFixed(2), (r.acos||0).toFixed(2), (r.roas||0).toFixed(2),
+                (r.convRate||0).toFixed(2), (r.revenue||0).toFixed(2), r.status, r.notes||""
+            ])];
+            downloadCSV(rows, `weekly_${weekRecord.weekEnding}.csv`);
+        };
+
+        // ========== MONTH SELECTOR ==========
+        window.openMonthSelector = function(callback) {
+            const now = new Date();
+            const months=["January","February","March","April","May","June","July","August","September","October","November","December"];
+            document.getElementById("uploadMonth").value = months[now.getMonth()];
+            document.getElementById("uploadYear").value = now.getFullYear().toString();
+            monthSelectorCallback = callback;
+            document.getElementById("monthSelectorModal").style.display = "flex";
+        };
+        window.confirmMonthSelection = function() {
+            const month=document.getElementById("uploadMonth").value;
+            const year=document.getElementById("uploadYear").value;
+            document.getElementById("monthSelectorModal").style.display="none";
+            if (monthSelectorCallback) monthSelectorCallback(month, year);
+            monthSelectorCallback=null;
+        };
+        window.cancelMonthSelection = function() { document.getElementById("monthSelectorModal").style.display="none"; monthSelectorCallback=null; };
+
+        // ========== ALERTS ==========
+        function renderAlertsPanel() {
+            const panel = document.getElementById("alertsPanel"); if(!panel) return;
+            const alerts=[];
+            projects.forEach(p=>{
+                const pData=monthlyData.filter(d=>d.projectId===p.id);
+                pData.forEach(d=>{
+                    if(d.acos>40&&d.roas>0) alerts.push({type:'orange',msg:`⚠️ ${p.clientCode} — ${d.month}: ACOS ${d.acos.toFixed(1)}% High`});
+                    if(d.roas<2&&d.roas>0) alerts.push({type:'red',msg:`🔴 ${p.clientCode} — ${d.month}: ROAS ${d.roas.toFixed(2)}x Low`});
+                });
+            });
+            if(alerts.length===0){panel.innerHTML='';return;}
+            panel.innerHTML=`<div class="alert-banner"><strong>🔔 Smart Alerts:</strong> ${alerts.map(a=>`<span class="alert-item ${a.type}">${a.msg}</span>`).join('')}</div>`;
+        }
+        function renderMonthlyAlerts(data) {
+            const panel=document.getElementById("monthlyAlertsPanel");if(!panel)return;
+            const alerts=[];
+            data.forEach(d=>{
+                if(d.acos>40&&d.roas>0) alerts.push({type:'orange',msg:`⚠️ ${d.month}: ACOS ${d.acos.toFixed(1)}% High`});
+                if(d.roas<2&&d.roas>0) alerts.push({type:'red',msg:`🔴 ${d.month}: ROAS ${d.roas.toFixed(2)}x Low`});
+                if(d.tacos>20) alerts.push({type:'orange',msg:`⚠️ ${d.month}: TACoS ${d.tacos.toFixed(1)}% High`});
+            });
+            if(alerts.length===0){panel.innerHTML='';return;}
+            panel.innerHTML=`<div class="alert-banner"><strong>🔔 Performance Alerts:</strong> ${alerts.map(a=>`<span class="alert-item ${a.type}">${a.msg}</span>`).join('')}</div>`;
+        }
+        function renderCampaignAlerts(data) {
+            const panel=document.getElementById("campaignAlertsPanel");if(!panel)return;
+            const stopCount=data.filter(c=>c.campaignPerformance==='Stop Campaign').length;
+            const highCount=data.filter(c=>c.campaignPerformance==='High').length;
+            const goodCount=data.filter(c=>c.campaignPerformance==='Good').length;
+            if(stopCount===0&&highCount===0){panel.innerHTML='';return;}
+            const items=[];
+            if(stopCount>0) items.push(`<span class="alert-item red">🔴 ${stopCount} campaigns need to be stopped</span>`);
+            if(highCount>0) items.push(`<span class="alert-item orange">⚠️ ${highCount} campaigns HIGH ACOS</span>`);
+            if(goodCount>0) items.push(`<span class="alert-item green">✅ ${goodCount} campaigns GOOD</span>`);
+            panel.innerHTML=`<div class="alert-banner"><strong>🎯 Campaign Alerts:</strong> ${items.join('')}</div>`;
+        }
+
+        // ========== CHARTS ==========
+        function renderMonthlyCharts(data) {
+            const chartsRow=document.getElementById("monthlyChartsRow");
+            if(data.length<2){chartsRow.style.display='none';return;}
+            chartsRow.style.display='grid';
+            const monthOrder=["January","February","March","April","May","June","July","August","September","October","November","December"];
+            const sorted=[...data].sort((a,b)=>monthOrder.indexOf(a.month)-monthOrder.indexOf(b.month));
+            const labels=sorted.map(d=>d.month.slice(0,3));
+            if(roasChartInst) roasChartInst.destroy();
+            roasChartInst=new Chart(document.getElementById("roasChart"),{type:'line',data:{labels,datasets:[{label:'ROAS',data:sorted.map(d=>+(d.roas||0).toFixed(2)),borderColor:'#2a5298',backgroundColor:'rgba(42,82,152,0.1)',tension:0.4,fill:true,pointRadius:5}]},options:{plugins:{legend:{display:false}},scales:{y:{beginAtZero:true,ticks:{callback:v=>v+'x'}}},responsive:true}});
+            if(spendSalesChartInst) spendSalesChartInst.destroy();
+            spendSalesChartInst=new Chart(document.getElementById("spendSalesChart"),{type:'bar',data:{labels,datasets:[{label:'Spend',data:sorted.map(d=>+(d.ppcSpend||0).toFixed(2)),backgroundColor:'#ef4444'},{label:'Sales',data:sorted.map(d=>+(d.totalSales||0).toFixed(2)),backgroundColor:'#10b981'}]},options:{plugins:{legend:{position:'top'}},scales:{y:{beginAtZero:true,ticks:{callback:v=>'$'+v.toLocaleString()}}},responsive:true}});
+        }
+
+        // ========== HELPERS ==========
+        window.showSection = function(section, event) {
+            ["projectsSection","monthlySection","campaignSection","weeklySection","adminSection"].forEach(id=>{
+                const el=document.getElementById(id); if(el) el.style.display="none";
+            });
+            const target=document.getElementById(section+"Section");
+            if(target) target.style.display="block";
+            document.querySelectorAll(".sub-nav-btn").forEach(btn=>btn.classList.remove("active"));
+            if(event&&event.currentTarget) event.currentTarget.classList.add("active");
+            if(section==="monthly"&&currentProjectId) refreshMonthlyData();
+            if(section==="campaign"&&currentCampaignProjectId) filterCampaignData();
+            if(section==="admin") { loadUsersList(); renderMarketplacesList(); populateMarketplaceDropdowns(); }
+        };
+
+        function populateYearFilter() {
+            const sel=document.getElementById("yearFilter"); if(!sel) return;
+            const currentYear=new Date().getFullYear();
+            sel.innerHTML='';
+            for(let y=2023;y<=currentYear+1;y++){const opt=document.createElement("option");opt.value=y;opt.textContent=y;if(y===currentYear)opt.selected=true;sel.appendChild(opt);}
+        }
+
+        function getFunnelStage(name) {
+            const n=(name||"").toLowerCase();
+            if(/(- auto |^auto |- broad |^broad )/i.test(n)||/\bauto\b/i.test(n)||n.includes("broad")) return "Top of Funnel";
+            if(/phrase|exact/.test(n)) return "Mid to Bottom";
+            if(/\bsd\b/.test(n)&&!/mix|pt\b/.test(n)) return "Mid to Bottom";
+            return "Check";
+        }
+        function getCampaignPerformance(orders,spend,sales) {
+            if(orders===0&&spend>=10) return "Stop Campaign";
+            if(orders===0) return "New Campaign";
+            const acos=sales>0?(spend/sales):0;
+            if(acos<0.30) return "Good";
+            if(acos<=0.50) return "Medium";
+            return "High";
+        }
+        function getWeekStart(endingDateStr) { const d=new Date(endingDateStr);const start=new Date(d);start.setDate(d.getDate()-6);return start.toISOString().slice(0,10); }
+        function formatDateDisplay(dateStr) { if(!dateStr)return"";const d=new Date(dateStr);return d.toLocaleDateString('en-US',{month:'short',day:'numeric',year:'numeric'}); }
+        function clean(v){return(v||"").replace(/^"|"$/g,'').replace(/\\n/g,'').trim();}
+        function cleanNum(v){return parseFloat((v||"").replace(/[$,%]/g,'').replace(/^"|"$/g,'').trim())||0;}
+        function cleanInt(v){return parseInt((v||"").replace(/[^0-9-]/g,''))||0;}
+        function parseCSVLine(line){let result=[],current='',inQuote=false;for(let i=0;i<line.length;i++){const ch=line[i];if(ch==='"'){inQuote=!inQuote;}else if(ch===','&&!inQuote){result.push(current);current='';}else{current+=ch;}}result.push(current);return result;}
+        function formatNum(n){return n?.toLocaleString()||"0";}
+        function downloadCSV(rows,filename){const csv=rows.map(row=>row.map(cell=>`"${cell??''}"`).join(",")).join("\n");const blob=new Blob(["\uFEFF"+csv],{type:"text/csv"});const link=document.createElement("a");link.href=URL.createObjectURL(blob);link.download=filename;link.click();}
+
+        // ========== DEFAULT MARKETPLACES ==========
+        let marketplaces = [
+            { name: "USA", code: "U" },
+            { name: "Canada", code: "C" },
+            { name: "UK", code: "K" },
+            { name: "Germany", code: "G" },
+            { name: "Turkey", code: "T" }
+        ];
+
+        async function loadMarketplaces() {
+            try {
+                const snap = await db.collection("settings").doc("marketplaces").get();
+                if (snap.exists && snap.data().list) marketplaces = snap.data().list;
+            } catch(e) { /* use defaults */ }
+            populateMarketplaceDropdowns();
+            renderMarketplacesList();
+        }
+
+        async function saveMarketplaces() {
+            try { await db.collection("settings").doc("marketplaces").set({ list: marketplaces }); }
+            catch(e) { console.log("Save marketplace error:", e); }
+        }
+
+        function populateMarketplaceDropdowns() {
+            const sel = document.getElementById("marketplaceProj");
+            if (!sel) return;
+            const current = sel.value;
+            sel.innerHTML = '<option value="">-- Select --</option>' +
+                marketplaces.map(m => `<option value="${m.name}" ${current===m.name?'selected':''}>${m.name}</option>`).join('');
+        }
+
+        function renderMarketplacesList() {
+            const div = document.getElementById("marketplacesList");
+            if (!div) return;
+            div.innerHTML = `<div style="display:flex;flex-wrap:wrap;gap:8px;">` +
+                marketplaces.map((m,i) => `
+                    <div style="background:white;border:1px solid #e2e8f0;border-radius:10px;padding:8px 14px;display:flex;align-items:center;gap:10px;font-size:13px;">
+                        <span style="background:#d1fae5;color:#065f46;padding:2px 8px;border-radius:8px;font-weight:700;font-size:12px;">${m.code}</span>
+                        <span>${m.name}</span>
+                        <button onclick="removeMarketplace(${i})" style="background:none;border:none;cursor:pointer;color:#ef4444;font-size:16px;padding:0;">×</button>
+                    </div>`).join('') +
+            `</div>`;
+        }
+
+        window.addMarketplace = async function() {
+            const name = document.getElementById("newMarketplaceName").value.trim();
+            if (!name) { alert("Please enter a marketplace name!"); return; }
+            // Auto-generate code: first letter of name
+            const finalCode = name.charAt(0).toUpperCase();
+            if (marketplaces.find(m => m.name.toLowerCase() === name.toLowerCase())) { alert("This marketplace already exists!"); return; }
+            marketplaces.push({ name, code: finalCode });
+            await saveMarketplaces();
+            populateMarketplaceDropdowns();
+            renderMarketplacesList();
+            document.getElementById("newMarketplaceName").value = "";
+        };
+
+        window.removeMarketplace = async function(idx) {
+            if (!confirm(`Remove "${marketplaces[idx].name}"?`)) return;
+            marketplaces.splice(idx, 1);
+            await saveMarketplaces();
+            populateMarketplaceDropdowns();
+            renderMarketplacesList();
+        };
+
+        // ========== AUTO CLIENT CODE GENERATION ==========
+        window.autoGenerateCode = function() {
+            const name = document.getElementById("clientName").value.trim();
+            const marketplace = document.getElementById("marketplaceProj").value;
+            if (!name) return;
+
+            // Split name into words, take first letter of each word (max 2 words)
+            const words = name.split(/\s+/).filter(w => w.length > 0);
+            let code = "";
+            if (words.length >= 2) {
+                code = words[0].charAt(0).toUpperCase() + words[1].charAt(0).toUpperCase();
+            } else if (words.length === 1) {
+                code = words[0].substring(0, 2).toUpperCase();
+            }
+
+            // Add marketplace first letter
+            if (marketplace) {
+                const mp = marketplaces.find(m => m.name === marketplace);
+                code += mp ? mp.code : marketplace.charAt(0).toUpperCase();
+            }
+
+            if (code) document.getElementById("clientCode").value = code;
+        };
+
+
+        // ========== PROJECT STRATEGY COLOR ==========
+        const strategyColors = {
+            '': { bg: '#fff', color: '#374151' },
+            'Setup': { bg: '#f3f4f6', color: '#374151' },
+            'Launch': { bg: '#d1fae5', color: '#065f46' },
+            'Optimizations': { bg: '#dbeafe', color: '#1e40af' },
+            'Scale': { bg: '#1e3a8a', color: '#ffffff' },
+            'Maintain': { bg: '#16a34a', color: '#ffffff' },
+            'Paused': { bg: '#fee2e2', color: '#991b1b' }
+        };
+        window.updateStrategyColor = function(sel) {
+            const c = strategyColors[sel.value] || strategyColors[''];
+            sel.style.background = c.bg;
+            sel.style.color = c.color;
+        };
+        // ========== USER MODAL ==========
+        window.openUserModal = function() { document.getElementById("userModal").style.display="flex"; loadUsersForAssign(); };
+        window.closeUserModal = function() { document.getElementById("userModal").style.display="none"; };
+            const pwEl = document.getElementById("loginPassword");
+            if (pwEl) pwEl.addEventListener("keydown", e=>{ if(e.key==="Enter") handleLogin(); });
+        
+    </script>
+
+
+    <style>
+        * { margin:0; padding:0; box-sizing:border-box; font-family:'Segoe UI',sans-serif; }
+        body { background:#f1f5f9; padding:20px; }
+        .login-container { max-width:420px; margin:60px auto; background:white; border-radius:20px; padding:35px; box-shadow:0 10px 40px rgba(0,0,0,0.12); }
+        .login-container h2 { text-align:center; margin-bottom:6px; color:#2a5298; font-size:22px; }
+        .login-sub { text-align:center; color:#94a3b8; font-size:13px; margin-bottom:24px; }
+        .input-group { margin-bottom:15px; }
+        .input-group label { display:block; margin-bottom:5px; font-weight:600; font-size:13px; }
+        .input-group input { width:100%; padding:11px 14px; border:1.5px solid #e2e8f0; border-radius:10px; font-size:14px; transition:0.2s; }
+        .input-group input:focus { border-color:#2a5298; outline:none; }
+        .login-btn { width:100%; padding:12px; background:#2a5298; color:white; border:none; border-radius:10px; cursor:pointer; font-size:15px; font-weight:600; }
+        .login-btn:hover { background:#1e3c72; }
+        .login-error { color:#ef4444; font-size:12px; text-align:center; margin-top:10px; min-height:18px; }
+        .dashboard { display:none; background:white; border-radius:20px; padding:20px; }
+        .dashboard-header { display:flex; justify-content:space-between; align-items:center; margin-bottom:20px; flex-wrap:wrap; gap:10px; background:linear-gradient(135deg,#1e3c72,#2a5298); color:white; padding:16px 20px; border-radius:14px; }
+        .dashboard-header h1 { font-size:18px; }
+        .dashboard-header p { font-size:12px; opacity:0.8; }
+        .btn { padding:8px 16px; border:none; border-radius:20px; cursor:pointer; font-size:13px; }
+        .btn-primary { background:#2a5298; color:white; }
+        .btn-danger { background:#ef4444; color:white; }
+        .btn-success { background:#10b981; color:white; }
+        .btn-outline { background:#e2e8f0; }
+        .btn-purple { background:#8b5cf6; color:white; }
+        .sub-nav { display:flex; gap:10px; margin-bottom:20px; border-bottom:1px solid #e2e8f0; padding-bottom:10px; flex-wrap:wrap; }
+        .sub-nav-btn { padding:8px 20px; background:#f1f5f9; border:none; border-radius:20px; cursor:pointer; font-size:13px; }
+        .sub-nav-btn.active { background:#2a5298; color:white; }
+        .projects-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(320px,1fr)); gap:20px; margin-top:20px; }
+        .project-card { background:white; border:1px solid #e2e8f0; border-radius:12px; padding:15px; cursor:pointer; transition:0.2s; }
+        .project-card:hover { box-shadow:0 5px 15px rgba(0,0,0,0.1); transform:translateY(-2px); }
+        .project-selector { background:#f0f9ff; padding:15px; border-radius:12px; margin-bottom:20px; border:1px solid #2a5298; }
+        .project-selector select { padding:8px 15px; border-radius:8px; margin-left:10px; border:1px solid #ccc; }
+        .upload-section { background:#f8fafc; padding:20px; border-radius:12px; margin-bottom:20px; border:2px dashed #cbd5e1; text-align:center; }
+        .upload-grid { display:grid; grid-template-columns:1fr 1fr; gap:20px; margin-top:15px; }
+        .upload-card { background:white; padding:15px; border-radius:12px; text-align:center; border:1px solid #e2e8f0; }
+        .filter-section { display:flex; gap:15px; margin-bottom:20px; flex-wrap:wrap; align-items:center; }
+        .filter-section select,.filter-section input { padding:8px 15px; border-radius:8px; border:1px solid #ccc; }
+        .stats-cards { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:15px; margin-bottom:20px; }
+        .stat-card { background:linear-gradient(135deg,#667eea,#764ba2); color:white; padding:15px; border-radius:12px; text-align:center; }
+        .stat-card .number { font-size:20px; font-weight:bold; }
+        .campaign-stats { display:grid; grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); gap:15px; margin-bottom:20px; }
+        .campaign-stat-card { background:linear-gradient(135deg,#2a5298,#1e3c72); color:white; padding:15px; border-radius:12px; text-align:center; }
+        .campaign-stat-card .number { font-size:24px; font-weight:bold; }
+        .table-wrapper { overflow-x:auto; }
+        table { width:100%; border-collapse:collapse; font-size:11px; min-width:1800px; }
+        th,td { padding:8px 6px; text-align:left; border-bottom:1px solid #e2e8f0; }
+        th { background:#f8fafc; font-weight:600; position:sticky; top:0; }
+        .campaign-table { min-width:1400px; font-size:11px; }
+        .modal { display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.5); align-items:center; justify-content:center; z-index:1000; }
+        .modal-card { background:white; width:90%; max-width:900px; max-height:85vh; border-radius:20px; padding:24px; overflow-y:auto; }
+        .modal-header { display:flex; justify-content:space-between; margin-bottom:15px; font-size:18px; font-weight:bold; }
+        .close-modal { font-size:24px; cursor:pointer; color:#94a3b8; }
+        .close-modal:hover { color:#ef4444; }
+        .form-row { display:flex; gap:15px; margin-bottom:15px; flex-wrap:wrap; }
+        .form-field { flex:1; min-width:180px; }
+        .form-field label { display:block; margin-bottom:5px; font-size:12px; font-weight:600; color:#475569; }
+        .form-field input,.form-field select,.form-field textarea { width:100%; padding:8px; border:1px solid #e2e8f0; border-radius:8px; font-size:13px; }
+        .small-note { font-size:11px; color:#666; margin-top:10px; text-align:center; }
+        .performance-stop { background:#fee2e2; color:#dc2626; padding:2px 8px; border-radius:12px; display:inline-block; font-size:10px; }
+        .performance-new { background:#fed7aa; color:#f59e0b; padding:2px 8px; border-radius:12px; display:inline-block; }
+        .performance-good { background:#d1fae5; color:#10b981; padding:2px 8px; border-radius:12px; display:inline-block; }
+        .performance-medium { background:#dbeafe; color:#3b82f6; padding:2px 8px; border-radius:12px; display:inline-block; }
+        .performance-high { background:#ede9fe; color:#8b5cf6; padding:2px 8px; border-radius:12px; display:inline-block; }
+        .month-select-modal { display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.6); align-items:center; justify-content:center; z-index:2000; }
+        .month-select-card { background:white; width:90%; max-width:420px; border-radius:20px; padding:30px; text-align:center; }
+        .month-select-card h3 { margin-bottom:8px; color:#2a5298; }
+        .month-select-card select { width:100%; padding:12px; border-radius:10px; border:2px solid #2a5298; font-size:15px; margin-bottom:10px; }
+        .month-select-card .year-row { display:flex; gap:10px; margin-bottom:20px; }
+        .month-select-card .year-row select { margin-bottom:0; }
+        .month-btn-row { display:flex; gap:10px; justify-content:center; }
+        .month-btn-row button { padding:10px 24px; border-radius:10px; border:none; cursor:pointer; font-size:14px; font-weight:600; }
+        .btn-confirm { background:#2a5298; color:white; }
+        .btn-cancel-month { background:#e2e8f0; color:#333; }
+        .week-nav { display:flex; align-items:center; gap:12px; flex-wrap:wrap; margin-bottom:18px; background:#f0f9ff; padding:14px 18px; border-radius:12px; border:1px solid #2a5298; }
+        .week-nav label { font-weight:700; color:#2a5298; }
+        .week-nav input[type="date"] { padding:8px 12px; border-radius:8px; border:2px solid #2a5298; font-size:14px; }
+        .week-range-badge { background:#2a5298; color:white; padding:6px 14px; border-radius:20px; font-size:13px; font-weight:600; }
+        .weekly-stats { display:grid; grid-template-columns:repeat(auto-fit,minmax(140px,1fr)); gap:12px; margin-bottom:18px; }
+        .wstat-card { background:linear-gradient(135deg,#1e3c72,#2a5298); color:white; padding:14px; border-radius:12px; text-align:center; }
+        .wstat-card .wnum { font-size:22px; font-weight:bold; }
+        .wstat-card .wlabel { font-size:11px; opacity:0.85; margin-top:4px; }
+        .week-table { min-width:1600px; font-size:11px; }
+        .status-good { background:#d1fae5; color:#065f46; padding:2px 8px; border-radius:10px; display:inline-block; font-size:10px; white-space:nowrap; }
+        .status-medium { background:#dbeafe; color:#1e40af; padding:2px 8px; border-radius:10px; display:inline-block; font-size:10px; white-space:nowrap; }
+        .status-high { background:#ede9fe; color:#6d28d9; padding:2px 8px; border-radius:10px; display:inline-block; font-size:10px; white-space:nowrap; }
+        .status-check { background:#fef3c7; color:#92400e; padding:2px 8px; border-radius:10px; display:inline-block; font-size:10px; white-space:nowrap; }
+        .status-decrease { background:#fee2e2; color:#991b1b; padding:2px 8px; border-radius:10px; display:inline-block; font-size:10px; white-space:nowrap; }
+        .no-weeks-msg { text-align:center; padding:40px; color:#94a3b8; }
+        .week-selector-row { display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-bottom:12px; }
+        .search-bar-wrap { position:relative; }
+        .search-bar-wrap input { padding:8px 15px 8px 36px; border-radius:8px; border:1px solid #ccc; font-size:13px; min-width:220px; }
+        .search-bar-wrap::before { content:"🔍"; position:absolute; left:10px; top:50%; transform:translateY(-50%); font-size:14px; }
+        .alert-banner { background:#fff7ed; border:1px solid #fed7aa; border-radius:10px; padding:10px 16px; margin-bottom:12px; font-size:12px; display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+        .alert-item { background:white; border-radius:6px; padding:4px 10px; border:1px solid #e2e8f0; font-size:11px; }
+        .alert-item.red { border-color:#fca5a5; color:#dc2626; }
+        .alert-item.orange { border-color:#fdba74; color:#ea580c; }
+        .alert-item.green { border-color:#86efac; color:#16a34a; }
+        .charts-row { display:grid; grid-template-columns:1fr 1fr; gap:20px; margin-bottom:20px; }
+        .chart-box { background:white; border:1px solid #e2e8f0; border-radius:14px; padding:16px; }
+        .chart-box h4 { font-size:13px; color:#475569; margin-bottom:10px; }
+        .proj-mini-stats { display:flex; gap:8px; margin-top:10px; flex-wrap:wrap; }
+        .proj-mini-stat { background:#f1f5f9; border-radius:8px; padding:4px 10px; font-size:11px; text-align:center; }
+        .proj-mini-stat span { display:block; font-weight:700; font-size:13px; color:#2a5298; }
+        .alert-dot { width:8px; height:8px; border-radius:50%; background:#ef4444; display:inline-block; margin-left:6px; animation:pulse 1.5s infinite; }
+        @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.4} }
+        /* Admin Panel */
+        .admin-panel { background:#faf5ff; border:1px solid #e9d5ff; border-radius:14px; padding:20px; }
+        .admin-panel h3 { color:#7c3aed; margin-bottom:16px; }
+        .user-form { display:grid; grid-template-columns:1fr 1fr; gap:12px; margin-bottom:16px; }
+        @media(max-width:600px){.user-form{grid-template-columns:1fr;}.charts-row{grid-template-columns:1fr;}.upload-grid{grid-template-columns:1fr;}}
+
+        /* ===== PROJECT GRID CARDS ===== */
+        .projects-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(300px,1fr)); gap:16px; margin-top:16px; }
+        .project-bar-card { background:white; border:1px solid #e2e8f0; border-radius:16px; padding:0; display:flex; flex-direction:column; transition:box-shadow 0.2s, transform 0.15s; overflow:hidden; }
+        .project-bar-card:hover { box-shadow:0 6px 24px rgba(42,82,152,0.13); transform:translateY(-2px); border-color:#bfdbfe; }
+        /* card header strip */
+        .pbar-header { padding:14px 16px; display:flex; align-items:center; gap:10px; transition:background 0.3s; }
+        .pbar-code { border-radius:8px; padding:6px 12px; font-size:15px; font-weight:900; letter-spacing:1px; white-space:nowrap; }
+        .pbar-header-info { flex:1; min-width:0; }
+        .pbar-name { font-size:14px; font-weight:700; display:flex; align-items:center; gap:6px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+        .pbar-header-sub { font-size:11px; margin-top:3px; }
+        /* card body */
+        .pbar-body { padding:12px 16px; flex:1; }
+        .pbar-meta { display:flex; gap:6px; flex-wrap:wrap; align-items:center; margin-bottom:12px; }
+        .pbar-mp-badge { background:#eff6ff; color:#1d4ed8; padding:2px 9px; border-radius:20px; font-size:11px; font-weight:600; }
+        .pbar-assign-badge { background:#f0fdf4; color:#15803d; padding:2px 9px; border-radius:20px; font-size:11px; font-weight:600; }
+        /* stats grid inside card */
+        .pbar-stats { display:grid; grid-template-columns:1fr 1fr; gap:8px; margin-bottom:14px; }
+        .pbar-stat { background:#f8fafc; border-radius:10px; padding:8px 10px; text-align:center; }
+        .pbar-stat-val { font-size:15px; font-weight:800; color:#1e293b; }
+        .pbar-stat-lbl { font-size:10px; color:#94a3b8; margin-top:2px; font-weight:600; text-transform:uppercase; letter-spacing:0.3px; }
+        /* card footer */
+        .pbar-footer { border-top:1px solid #f1f5f9; padding:10px 16px; display:flex; align-items:center; justify-content:space-between; }
+        .pbar-last-data { font-size:11px; color:#94a3b8; font-weight:600; }
+        .pbar-right { display:flex; }
+        .btn-view-details { background:linear-gradient(135deg,#2a5298,#1e3c72); color:white; padding:7px 18px; border-radius:20px; font-size:12px; font-weight:600; border:none; cursor:pointer; white-space:nowrap; transition:opacity 0.2s; }
+        .btn-view-details:hover { opacity:0.88; }
+        /* ===== PROJECT DETAILS MODAL ===== */
+        .detail-info-box { background:#f8fafc; border-radius:10px; padding:10px 14px; }
+        .detail-label { font-size:11px; font-weight:700; color:#94a3b8; margin-bottom:3px; text-transform:uppercase; }
+        .detail-value { font-size:15px; font-weight:700; color:#1e293b; }
+        #alertsPanel { margin-bottom:16px; }
+        .modal-footer { display:flex; gap:10px; margin-top:16px; justify-content:flex-end; }
+        .header-right { display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
+        .user-badge { background:rgba(255,255,255,0.2); padding:5px 12px; border-radius:20px; font-size:12px; }
+    </style>
+</head>
+<body>
+
+<!-- Login Page -->
+<div id="loginPage" class="login-container">
+    <h2>📊 Client Performance Hub</h2>
+    <p class="login-sub">Sign in to your account</p>
+    <div class="input-group"><label>Email</label><input type="email" id="loginEmail" placeholder="email@example.com"></div>
+    <div class="input-group"><label>Password</label><input type="password" id="loginPassword" placeholder="••••••••"></div>
+    <button class="login-btn" id="loginBtn" onclick="handleLogin()">🔐 Login</button>
+    <div class="login-error" id="loginError"></div>
+</div>
+
+<!-- Dashboard -->
+<div id="dashboardApp" class="dashboard">
+    <div class="dashboard-header">
+        <div><h1>📋 Client Performance Hub</h1><p>Projects | Monthly Report | Campaign Tracker | Weekly Tracking</p></div>
+        <div class="header-right">
+            <span id="syncStatus" style="font-size:12px;font-weight:600;color:#86efac;"></span>
+            <span id="currentUserName" class="user-badge"></span>
+            <button class="btn btn-primary" onclick="openProjectModal()">➕ Add Project</button>
+            <button class="btn btn-purple admin-only" onclick="openUserModal()">👥 Manage Users</button>
+            <button class="btn btn-danger" onclick="logout()">🚪 Logout</button>
+        </div>
+    </div>
+
+    <div class="sub-nav">
+        <button class="sub-nav-btn active" onclick="showSection('projects', event)">📁 Projects</button>
+        <button class="sub-nav-btn" onclick="showSection('monthly', event)">📅 Monthly Report</button>
+        <button class="sub-nav-btn" onclick="showSection('campaign', event)">🎯 Campaign Tracker</button>
+        <button class="sub-nav-btn" onclick="showSection('weekly', event)">📈 Weekly Tracking</button>
+        <button class="sub-nav-btn admin-only" onclick="showSection('admin', event)" style="background:#f5f3ff;color:#7c3aed;">👑 Admin Panel</button>
+    </div>
+
+    <!-- Projects -->
+    <div id="projectsSection">
+        <div id="alertsPanel"></div>
+        <h2>My Projects</h2>
+        <div id="projectsList" class="projects-grid"></div>
+    </div>
+
+    <!-- Monthly Report -->
+    <div id="monthlySection" style="display:none;">
+        <div class="project-selector">
+            <label>📌 Select Project:</label>
+            <select id="projectSelectMonthly" onchange="onMonthlyProjectChange()"><option value="">-- Select Project --</option></select>
+            <span id="monthlyProjectInfo" style="margin-left:10px;"></span>
+        </div>
+        <div id="monthlyUploadArea" style="display:none;">
+            <div class="upload-section">
+                <h3>📊 Upload Reports to Auto-Merge</h3>
+                <div class="upload-grid">
+                    <div class="upload-card">
+                        <h4>📈 Business Report (Sales)</h4>
+                        <p style="font-size:11px;">Format: Date, Total Sales, Units Ordered</p>
+                        <input type="file" id="businessFile" accept=".csv" style="display:none" onchange="uploadBusinessCSV(this)">
+                        <button class="btn btn-primary" onclick="document.getElementById('businessFile').click()">📂 Upload Business CSV</button>
+                        <div id="businessStatus" style="margin-top:8px;font-size:11px;color:#10b981;"></div>
+                    </div>
+                    <div class="upload-card">
+                        <h4>🎯 Campaign Report (Amazon PPC)</h4>
+                        <p style="font-size:11px;">Format: Campaign Start Date, Impressions, Clicks, Spend, Sales, Orders</p>
+                        <input type="file" id="campaignReportFile" accept=".csv" style="display:none" onchange="uploadCampaignReportCSV(this)">
+                        <button class="btn btn-primary" onclick="document.getElementById('campaignReportFile').click()">📂 Upload Campaign CSV</button>
+                        <div id="campaignStatus" style="margin-top:8px;font-size:11px;color:#f59e0b;"></div>
+                    </div>
+                </div>
+                <div class="small-note">💡 Step 1: Business Report → Step 2: Campaign Report → Auto Merge</div>
+            </div>
+            <div class="filter-section">
+                <select id="yearFilter" onchange="refreshMonthlyData()"></select>
+                <select id="monthFilter" onchange="refreshMonthlyData()">
+                    <option value="all">All Months</option>
+                    <option>January</option><option>February</option><option>March</option><option>April</option><option>May</option><option>June</option>
+                    <option>July</option><option>August</option><option>September</option><option>October</option><option>November</option><option>December</option>
+                </select>
+                <button class="btn btn-success" onclick="exportMonthlyData()">📥 Export CSV</button>
+                <button class="btn btn-outline" onclick="openAddManualData()">➕ Manual Entry</button>
+            </div>
+            <div id="monthlyAlertsPanel"></div>
+            <div class="stats-cards" id="monthlyStatsCards"></div>
+            <div class="charts-row" id="monthlyChartsRow" style="display:none;">
+                <div class="chart-box"><h4>📈 ROAS Trend</h4><canvas id="roasChart" height="160"></canvas></div>
+                <div class="chart-box"><h4>💰 Spend vs Sales</h4><canvas id="spendSalesChart" height="160"></canvas></div>
+            </div>
+            <div class="table-wrapper">
+                <table>
+                    <thead><tr><th>Status</th><th>Month</th><th>Client Code</th><th>Client Name</th><th>Marketplace</th><th>PPC Spend</th><th>PPC Sales</th><th>Total Sales</th><th>Organic Sales</th><th>Total Revenue</th><th>Overall ROAS</th><th>ACOS%</th><th>Clicks</th><th>PPC Orders</th><th>Conv Rate%</th><th>Impressions</th><th>CTR%</th><th>CPC Avg</th><th>CPA</th><th>TACoS%</th><th>Units Orders</th><th>Actions</th></tr></thead>
+                    <tbody id="monthlyTableBody"></tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+
+    <!-- Campaign Tracker -->
+    <div id="campaignSection" style="display:none;">
+        <div class="project-selector">
+            <label>📌 Select Project:</label>
+            <select id="projectSelectCampaign" onchange="onCampaignProjectChange()"><option value="">-- Select Project --</option></select>
+        </div>
+        <div id="campaignUploadArea" style="display:none;">
+            <div class="upload-section">
+                <h3>🎯 Upload Amazon Campaign Report</h3>
+                <input type="file" id="campaignTrackerFile" accept=".csv" style="display:none" onchange="processCampaignTrackerData(this)">
+                <button class="btn btn-primary" onclick="document.getElementById('campaignTrackerFile').click()">📂 Upload Campaign CSV</button>
+                <div id="campaignUploadStatus" style="margin-top:8px;font-size:12px;color:#10b981;min-height:18px;"></div>
+                <div class="small-note">💡 Auto-generates Campaign ID (e.g. BYU-001), Funnel Stage, Performance Status</div>
+            </div>
+
+            <!-- Filters Row -->
+            <div class="filter-section" style="flex-wrap:wrap;gap:10px;">
+                <select id="campaignMonthFilter" onchange="filterCampaignData()">
+                    <option value="all">📅 All Months</option>
+                    <option>January</option><option>February</option><option>March</option><option>April</option><option>May</option><option>June</option>
+                    <option>July</option><option>August</option><option>September</option><option>October</option><option>November</option><option>December</option>
+                </select>
+                <select id="campaignStatusFilter" onchange="filterCampaignData()">
+                    <option value="all">🔘 All Status</option>
+                    <option value="ENABLED">ENABLED</option>
+                    <option value="PAUSED">PAUSED</option>
+                    <option value="OUT_OF_BUDGET">OUT OF BUDGET</option>
+                </select>
+                <select id="campaignTypeFilter" onchange="filterCampaignData()">
+                    <option value="all">📋 All Types</option>
+                    <option value="SP">SP</option>
+                    <option value="SD">SD</option>
+                    <option value="SB">SB</option>
+                </select>
+                <select id="campaignTargetFilter" onchange="filterCampaignData()">
+                    <option value="all">🎯 All Targeting</option>
+                    <option value="AUTOMATIC">AUTOMATIC</option>
+                    <option value="MANUAL">MANUAL</option>
+                </select>
+                <select id="campaignFunnelFilter" onchange="filterCampaignData()">
+                    <option value="all">🔻 All Funnel</option>
+                    <option value="Top">Top</option>
+                    <option value="Middle">Middle</option>
+                    <option value="Bottom">Bottom</option>
+                </select>
+                <select id="campaignPerfFilter" onchange="filterCampaignData()">
+                    <option value="all">⭐ All Performance</option>
+                    <option value="High Performer">High Performer</option>
+                    <option value="Good">Good</option>
+                    <option value="Medium">Medium</option>
+                    <option value="New Campaign">New Campaign</option>
+                    <option value="Stop Campaign">Stop Campaign</option>
+                </select>
+                <input type="text" id="campaignSearch" placeholder="🔍 Search campaign..." oninput="filterCampaignData()" style="min-width:160px;">
+                <button class="btn btn-success" onclick="exportCampaignData()">📥 Export CSV</button>
+            </div>
+
+            <div id="campaignAlertsPanel"></div>
+            <div class="campaign-stats" id="campaignStatsCards"></div>
+            <div class="table-wrapper">
+                <table class="campaign-table">
+                    <thead><tr>
+                        <th>Campaign_ID</th><th>Client_Code</th><th>Marketplace</th><th>Funnel_Stage</th>
+                        <th>Status</th><th>Campaign_Type</th><th>Targeting</th><th>Bidding_Strategy</th>
+                        <th>Campaign_Name</th><th>Launch_Date</th><th>Daily_Budget</th>
+                        <th>Impressions</th><th>Clicks</th><th>CTR_%</th><th>Actual_Spend</th>
+                        <th>CPC</th><th>Orders</th><th>Sales</th><th>ACOS</th><th>ROAS</th>
+                        <th>Conversion_Rate_%</th><th>Revenue</th><th>Campaign_Performance</th><th>Action</th>
+                    </tr></thead>
+                    <tbody id="campaignTableBody"></tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+
+    <!-- Weekly Tracking -->
+    <div id="weeklySection" style="display:none;">
+        <div class="project-selector" style="margin-bottom:16px;">
+            <label>📌 Select Project:</label>
+            <select id="projectSelectWeekly" onchange="onWeeklyProjectChange()"><option value="">-- Select Project --</option></select>
+            <span id="weeklyProjectInfo" style="margin-left:10px;"></span>
+        </div>
+        <div id="weeklyContent" style="display:none;">
+            <div class="week-nav">
+                <label>📅 Start Date:</label>
+                <input type="date" id="weekStartDate" onchange="onWeekDateChange()">
+                <label>End Date:</label>
+                <input type="date" id="weekEndingDate" onchange="onWeekDateChange()">
+                <span id="weekRangeBadge" class="week-range-badge" style="display:none;"></span>
+                <button class="btn btn-primary" onclick="document.getElementById('weeklyFile').click()">📂 Upload CSV</button>
+                <input type="file" id="weeklyFile" accept=".csv" style="display:none" onchange="uploadWeeklyCSV(this)">
+                <div id="weeklyUploadStatus" style="font-size:12px;color:#10b981;"></div>
+            </div>
+            <div id="savedWeeksRow" style="display:none;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:12px;">
+                <span style="font-size:12px;color:#2a5298;font-weight:600;white-space:nowrap;">💾 Saved weeks:</span>
+                <div id="savedWeeksBadges" style="display:flex;gap:6px;flex-wrap:wrap;"></div>
+            </div>
+
+            <!-- Weekly Filters -->
+            <div class="filter-section" style="flex-wrap:wrap;gap:10px;margin-bottom:16px;">
+                <select id="weeklyStateFilter" onchange="renderWeeklyData()">
+                    <option value="all">🔘 All Status</option>
+                    <option value="ENABLED">✅ ENABLED</option>
+                    <option value="PAUSED">⏸️ PAUSED</option>
+                    <option value="ARCHIVED">📦 ARCHIVED</option>
+                </select>
+                <select id="weeklyTypeFilter" onchange="renderWeeklyData()">
+                    <option value="all">📋 All Types</option>
+                    <option value="SP">SP</option>
+                    <option value="SD">SD</option>
+                    <option value="SB">SB</option>
+                    <option value="SB2">SB2</option>
+                </select>
+                <select id="weeklyTargetFilter" onchange="renderWeeklyData()">
+                    <option value="all">🎯 All Targeting</option>
+                    <option value="AUTOMATIC">AUTOMATIC</option>
+                    <option value="MANUAL">MANUAL</option>
+                </select>
+                <select id="weeklyStatusFilter" onchange="renderWeeklyData()">
+                    <option value="all">⭐ All Performance</option>
+                    <option value="Good">✅ Good</option>
+                    <option value="Medium">⚠️ Medium</option>
+                    <option value="High">🔴 High</option>
+                    <option value="Decrease">🔻 Decrease Bids</option>
+                    <option value="Check">🔍 Check Targeting</option>
+                </select>
+                <input type="text" id="weeklySearch" placeholder="🔍 Search campaign..." oninput="renderWeeklyData()" style="min-width:160px;padding:8px 12px;border-radius:8px;border:1px solid #ccc;">
+                <button class="btn btn-success" onclick="exportWeeklyData()">📥 Export CSV</button>
+                <button class="btn" style="background:#fee2e2;color:#dc2626;" onclick="deleteCurrentWeek()">🗑️ Delete Week</button>
+            </div>
+
+            <div class="weekly-stats" id="weeklyStatsCards"></div>
+            <div class="table-wrapper">
+                <table class="week-table">
+                    <thead><tr>
+                        <th>#</th>
+                        <th>Campaign Status</th>
+                        <th style="min-width:220px;">Campaign Name</th>
+                        <th>Type</th>
+                        <th>Targeting</th>
+                        <th style="min-width:140px;">Bidding Strategy</th>
+                        <th>Budget ($)</th>
+                        <th>Impressions</th>
+                        <th>Clicks</th>
+                        <th>CTR_%</th>
+                        <th>Spend ($)</th>
+                        <th>CPC ($)</th>
+                        <th>Orders</th>
+                        <th>Sales ($)</th>
+                        <th>ACOS_%</th>
+                        <th>ROAS</th>
+                        <th>Conv_%</th>
+                        <th>Revenue ($)</th>
+                        <th>Status</th>
+                        <th style="min-width:160px;">Notes</th>
+                    </tr></thead>
+                    <tbody id="weeklyTableBody"></tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+
+    <!-- Admin Panel -->
+    <div id="adminSection" style="display:none;">
+        <div class="admin-panel">
+            <h3>👑 Admin Panel — Team Management</h3>
+            <div style="display:flex;gap:10px;margin-bottom:20px;">
+                <button class="btn btn-purple" onclick="openUserModal()">➕ Create New User</button>
+                <button class="btn btn-outline" onclick="loadUsersList()">🔄 Refresh</button>
+            </div>
+            <div id="usersList"><p style="color:#94a3b8;">Loading users...</p></div>
+        </div>
+
+        <!-- Marketplaces Section -->
+        <div class="admin-panel" style="margin-top:20px;background:#f0fdf4;border-color:#bbf7d0;">
+            <h3 style="color:#16a34a;">🌍 Marketplace Management</h3>
+            <div style="display:flex;gap:10px;margin-bottom:16px;flex-wrap:wrap;">
+                <input id="newMarketplaceName" placeholder="e.g. Australia" style="padding:8px 12px;border:1px solid #e2e8f0;border-radius:8px;font-size:13px;min-width:180px;">
+                <button class="btn btn-success" onclick="addMarketplace()">➕ Add</button>
+            </div>
+            <div id="marketplacesList"></div>
+        </div>
+    </div>
+</div>
+
+<!-- Project Details Modal -->
+<div id="projectDetailsModal" class="modal">
+    <div class="modal-card" style="max-width:640px;">
+        <div class="modal-header">
+            <span>📁 Project Details</span>
+            <span class="close-modal" onclick="closeProjectDetails()">&times;</span>
+        </div>
+        <input type="hidden" id="projDetailProjectId">
+        <div id="projDetailBody"></div>
+        <div class="modal-footer" style="border-top:1px solid #e2e8f0;padding-top:14px;margin-top:4px;">
+            <button class="btn btn-outline" onclick="closeProjectDetails()">Close</button>
+            <button class="btn btn-primary" onclick="closeProjectDetails();openProjectModal(parseInt(document.getElementById('projDetailProjectId').value))">✏️ Edit Details</button>
+            <button class="btn btn-outline" style="background:#fee2e2;color:#dc2626;" onclick="closeProjectDetails();deleteProject(parseInt(document.getElementById('projDetailProjectId').value))">🗑️ Delete</button>
+        </div>
+    </div>
+</div>
+
+<!-- Manual Data Modal -->
+<div id="manualDataModal" class="modal">
+    <div class="modal-card">
+        <div class="modal-header"><span>➕ Add Monthly Data Manually</span><span class="close-modal" onclick="closeManualModal()">&times;</span></div>
+        <form onsubmit="saveManualData(event)">
+            <div class="form-row">
+                <div class="form-field"><label>Year</label><select id="manualYear"><option>2024</option><option>2025</option><option selected>2026</option></select></div>
+                <div class="form-field"><label>Month</label><select id="manualMonth"><option>January</option><option>February</option><option>March</option><option>April</option><option>May</option><option>June</option><option>July</option><option>August</option><option>September</option><option>October</option><option>November</option><option>December</option></select></div>
+            </div>
+            <div class="form-row">
+                <div class="form-field"><label>PPC Spend ($)</label><input type="number" id="manualSpend" step="any" value="0"></div>
+                <div class="form-field"><label>PPC Sales ($)</label><input type="number" id="manualPpcSales" step="any" value="0"></div>
+                <div class="form-field"><label>Total Sales ($)</label><input type="number" id="manualTotalSales" step="any" value="0"></div>
+            </div>
+            <div class="form-row">
+                <div class="form-field"><label>Clicks</label><input type="number" id="manualClicks" value="0"></div>
+                <div class="form-field"><label>Orders</label><input type="number" id="manualOrders" value="0"></div>
+                <div class="form-field"><label>Impressions</label><input type="number" id="manualImpressions" value="0"></div>
+                <div class="form-field"><label>Units</label><input type="number" id="manualUnits" value="0"></div>
+            </div>
+            <div class="modal-footer"><button type="submit" class="btn btn-primary">💾 Save to Cloud</button><button type="button" class="btn btn-outline" onclick="closeManualModal()">Cancel</button></div>
+        </form>
+    </div>
+</div>
+
+<!-- Project Modal -->
+<div id="projectModal" class="modal">
+    <div class="modal-card">
+        <div class="modal-header"><span id="projectModalTitle">Add New Project</span><span class="close-modal" onclick="closeProjectModal()">&times;</span></div>
+        <form id="projectForm" onsubmit="saveProjectForm(event)">
+            <input type="hidden" id="editProjectId">
+            <div class="form-row">
+                <div class="form-field">
+                    <label>Client Name *</label>
+                    <input id="clientName" required placeholder="e.g. Little Dedi" oninput="autoGenerateCode()">
+                </div>
+                <div class="form-field">
+                    <label>Marketplace *</label>
+                    <select id="marketplaceProj" onchange="autoGenerateCode()">
+                        <option value="">-- Select --</option>
+                    </select>
+                </div>
+            </div>
+            <div class="form-row">
+                <div class="form-field">
+                    <label>Client Code <span style="font-size:10px;color:#10b981;">✨ Auto-generated</span></label>
+                    <input id="clientCode" required placeholder="Auto-generate hoga..." style="background:#f0fdf4;font-weight:700;color:#2a5298;font-size:15px;">
+                </div>
+                <div class="form-field">
+                    <label>Performance Status</label>
+                    <select id="performanceStatus" style="background:#f0fdf4;color:#374151;font-weight:600;" disabled><option>Excellent</option><option>Good</option><option>Average</option><option>Critical</option></select>
+                    <div style="font-size:10px;color:#10b981;margin-top:3px;">✨ Monthly report upload pe auto-set hoga</div>
+                </div>
+            </div>
+            <div class="form-row">
+                <div class="form-field">
+                    <label>Project Strategy</label>
+                    <select id="projectStrategy" onchange="updateStrategyColor(this)" style="font-weight:600;transition:background 0.2s;">
+                        <option value="" style="background:#fff;">-- Select Strategy --</option>
+                        <option value="Setup" style="background:#f3f4f6;color:#374151;">Setup</option>
+                        <option value="Launch" style="background:#d1fae5;color:#065f46;">Launch</option>
+                        <option value="Optimizations" style="background:#dbeafe;color:#1e40af;">Optimizations</option>
+                        <option value="Scale" style="background:#1e3a8a;color:#fff;">Scale</option>
+                        <option value="Maintain" style="background:#16a34a;color:#fff;">Maintain</option>
+                        <option value="Paused" style="background:#fee2e2;color:#991b1b;">Paused</option>
+                    </select>
+                </div>
+                <div class="form-field"><label>Monthly Budget ($)</label><input type="number" id="monthlyBudget" step="any" value="0"></div>
+            </div>
+            <div class="form-row">
+                <div class="form-field"><label>Current ROAS</label><input type="number" id="currentRoas" step="0.1"></div>
+                <div class="form-field"><label>Monthly Revenue ($)</label><input type="number" id="monthlyRevenue" step="any" value="0"></div>
+            </div>
+            <div class="form-row">
+                <div class="form-field"><label>Assign to Team Member</label><select id="assignedToUid"><option value="">-- Select Member --</option></select></div>
+            </div>
+            <div class="form-row">
+                <div class="form-field"><label>Last Updated</label><input type="date" id="lastUpdated"></div>
+            </div>
+            <div class="form-field"><label>Notes</label><textarea id="notes" rows="2"></textarea></div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-outline" onclick="closeProjectModal()">Cancel</button>
+                <button type="submit" class="btn btn-primary">💾 Save to Cloud</button>
+            </div>
+        </form>
+    </div>
+</div>
+
+<!-- Create User Modal -->
+<div id="userModal" class="modal">
+    <div class="modal-card" style="max-width:500px;">
+        <div class="modal-header"><span>👥 Create New User</span><span class="close-modal" onclick="closeUserModal()">&times;</span></div>
+        <div class="form-row">
+            <div class="form-field"><label>Full Name *</label><input id="newUserName" placeholder="e.g. Riya Mehta"></div>
+        </div>
+        <div class="form-row">
+            <div class="form-field"><label>Email *</label><input type="email" id="newUserEmail" placeholder="riya@company.com"></div>
+            <div class="form-field"><label>Password *</label><input type="text" id="newUserPassword" placeholder="Min 6 characters"></div>
+        </div>
+        <div class="form-row">
+            <div class="form-field"><label>Role</label>
+                <select id="newUserRole">
+                    <option value="member">👤 Team Member</option>
+                    <option value="admin">👑 Admin</option>
+                </select>
+            </div>
+        </div>
+        <div style="color:#ef4444;font-size:12px;min-height:18px;" id="createUserError"></div>
+        <div class="modal-footer">
+            <button class="btn btn-outline" onclick="closeUserModal()">Cancel</button>
+            <button class="btn btn-purple" onclick="createUser()">✅ Create User</button>
+        </div>
+    </div>
+</div>
+
+<!-- Month Selector Modal -->
+<div id="monthSelectorModal" class="month-select-modal">
+    <div class="month-select-card">
+        <h3>📅 Select Data Month</h3>
+        <p style="color:#666;font-size:13px;margin-bottom:20px;">Select the month and year before uploading</p>
+        <div class="year-row">
+            <select id="uploadYear"><option value="2024">2024</option><option value="2025">2025</option><option value="2026" selected>2026</option></select>
+            <select id="uploadMonth"><option>January</option><option>February</option><option>March</option><option>April</option><option>May</option><option>June</option><option>July</option><option>August</option><option>September</option><option>October</option><option>November</option><option>December</option></select>
+        </div>
+        <div class="month-btn-row">
+            <button class="btn-confirm" onclick="confirmMonthSelection()">✅ Confirm</button>
+            <button class="btn-cancel-month" onclick="cancelMonthSelection()">❌ Cancel</button>
+        </div>
+    </div>
+</div>
+
+</body>
+</html>
